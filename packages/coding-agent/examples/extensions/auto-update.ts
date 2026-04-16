@@ -14,37 +14,18 @@
  * - On "Update now", pi exits first, updates in a detached runner, then restarts automatically.
  *
  * Usage:
- * 1. Copy this directory to ~/.pi/agent/extensions/auto-update/
- * 2. Run npm install inside ~/.pi/agent/extensions/auto-update/
- * 3. Start pi normally
- * 4. Optional: set PI_AUTO_UPDATE_COMMAND for pnpm/yarn/bun/custom installs
+ * 1. Copy this file to ~/.pi/agent/extensions/auto-update.ts
+ * 2. Start pi normally
+ * 3. Optional: set PI_AUTO_UPDATE_COMMAND for pnpm/yarn/bun/custom installs
  */
 
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { createRequire } from "node:module";
+import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, Theme } from "@mariozechner/pi-coding-agent";
-import { getAgentDir, getMarkdownTheme, SettingsManager, VERSION } from "@mariozechner/pi-coding-agent";
-import {
-	type Component,
-	type Keybinding,
-	type KeybindingsManager,
-	type KeyId,
-	Markdown,
-	type TUI,
-	truncateToWidth,
-} from "@mariozechner/pi-tui";
-
-const require = createRequire(import.meta.url);
-const semver: {
-	compare: (a: string, b: string) => number;
-	valid: (version: string) => string | null;
-} = require("semver");
-const compareSemver = semver.compare;
-const validSemver = semver.valid;
+import { getAgentDir, getMarkdownTheme, VERSION } from "@mariozechner/pi-coding-agent";
+import { type Component, Markdown, matchesKey, type TUI, truncateToWidth } from "@mariozechner/pi-tui";
 
 const PACKAGE_NAME = "@mariozechner/pi-coding-agent";
 const CHANGELOG_URL = "https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/CHANGELOG.md";
@@ -55,17 +36,18 @@ const WINDOWS_STATUS_STALE_MS = 10 * 60 * 1000;
 const AGENT_DIR = getAgentDir();
 const STATE_FILE = join(AGENT_DIR, "pi-auto-update.json");
 const STATUS_FILE = join(AGENT_DIR, "pi-auto-update-status.json");
+const WINDOWS_HELPER_FILE = join(AGENT_DIR, "pi-auto-update-helper.cjs");
 const WINDOWS_PAYLOAD_DIR = join(AGENT_DIR, "tmp");
 const WINDOWS_LOG_DIR = join(AGENT_DIR, "logs");
-const INSTALL_METADATA_FILE_NAME = "pi-auto-update-install.json";
-const RUNNER_FILE = fileURLToPath(new URL("./runner.cjs", import.meta.url));
+
+const UPDATE_PHASES = new Set(["scheduled", "updating", "updated", "restarting", "completed", "failed"]);
+const WINDOWS_UPDATE_MODES = new Set(["helper-update-only", "helper-update-and-restart"]);
 
 type UIContext = ExtensionContext | ExtensionCommandContext;
 type InstallMethod = "npm" | "pnpm" | "yarn" | "bun" | "unknown";
 type UpdateChoice = "update" | "view-changelog" | "skip" | "dismiss";
 type ChoiceHandlingResult = "continue" | "done";
-type UpdateCommandSource = "env" | "settings" | "state" | "install-metadata" | "heuristic";
-type CommandSource = UpdateCommandSource | "default";
+type CommandSource = "env" | "state" | "default";
 type WindowsUpdateMode = "helper-update-only" | "helper-update-and-restart";
 type UpdatePhase = "scheduled" | "updating" | "updated" | "restarting" | "completed" | "failed";
 
@@ -86,34 +68,9 @@ interface UpdateState {
 	lastCheckedAt?: number;
 	latestVersion?: string;
 	skippedVersion?: string;
-	validatedUpdateCommand?: CommandSpec;
-	validatedRestartCommand?: CommandSpec;
-	validatedInstallMethod?: InstallMethod;
-	validatedAt?: number;
-	lastUpdatedVersion?: string;
-}
-
-interface AutoUpdateSettingsConfig {
-	updateCommand?: CommandSpec;
-	restartCommand?: CommandSpec;
-}
-
-interface InstallMetadata {
-	updateCommand?: CommandSpec;
-	restartCommand?: CommandSpec;
 	installMethod?: InstallMethod;
-}
-
-interface ResolvedUpdateCommand {
-	command: CommandSpec;
-	source: UpdateCommandSource;
-	installMethod?: InstallMethod;
-}
-
-interface RestartCommandResolution {
-	command: CommandSpec;
-	source: CommandSource;
-	autoRestartAllowed: boolean;
+	updateCommand?: string;
+	restartCommand?: string;
 }
 
 interface NpmLatestResponse {
@@ -123,28 +80,16 @@ interface NpmLatestResponse {
 interface ScheduledUpdatePayload {
 	parentPid: number;
 	cwd: string;
-	stateFile: string;
 	latestVersion: string;
 	updateCommand: CommandSpec;
 	restartCommand: CommandSpec;
 	updateCommandDisplay: string;
-	validatedInstallMethod?: InstallMethod;
 }
 
-interface WindowsUpdatePayload {
-	updateId: string;
-	parentPid: number;
-	cwd: string;
-	stateFile: string;
-	statusFile: string;
-	latestVersion: string;
-	mode: WindowsUpdateMode;
-	updateCommand: CommandSpec;
-	restartCommand: CommandSpec;
-	updateCommandDisplay: string;
-	restartCommandDisplay: string;
-	logFile: string;
-	validatedInstallMethod?: InstallMethod;
+interface RestartCommandResolution {
+	command: CommandSpec;
+	source: CommandSource;
+	autoRestartAllowed: boolean;
 }
 
 interface WindowsUpdateStatus {
@@ -163,13 +108,19 @@ interface WindowsUpdateStatus {
 	failedAt?: number;
 }
 
-type ScheduleResult =
-	| { scheduled: false }
-	| {
-			scheduled: true;
-			updateCommand: CommandSpec;
-			restartCommand: CommandSpec;
-	  };
+interface WindowsUpdatePayload {
+	updateId: string;
+	parentPid: number;
+	cwd: string;
+	latestVersion: string;
+	mode: WindowsUpdateMode;
+	updateCommand: CommandSpec;
+	restartCommand: CommandSpec;
+	statusFile: string;
+	logFile: string;
+	updateCommandDisplay: string;
+	restartCommandDisplay: string;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -182,81 +133,21 @@ function parseInstallMethod(value: unknown): InstallMethod | undefined {
 }
 
 function parseUpdatePhase(value: unknown): UpdatePhase | undefined {
-	return value === "scheduled" ||
-		value === "updating" ||
-		value === "updated" ||
-		value === "restarting" ||
-		value === "completed" ||
-		value === "failed"
-		? value
-		: undefined;
+	return typeof value === "string" && UPDATE_PHASES.has(value) ? (value as UpdatePhase) : undefined;
 }
 
 function parseWindowsUpdateMode(value: unknown): WindowsUpdateMode | undefined {
-	return value === "helper-update-only" || value === "helper-update-and-restart" ? value : undefined;
+	return typeof value === "string" && WINDOWS_UPDATE_MODES.has(value) ? (value as WindowsUpdateMode) : undefined;
 }
 
-function parseCommandSpec(value: unknown): CommandSpec | undefined {
-	if (typeof value === "string" && value.trim().length > 0) {
-		return { kind: "shell", command: value.trim() };
-	}
-
-	if (!isRecord(value)) {
-		return undefined;
-	}
-
-	if (value.kind === "shell" && typeof value.command === "string" && value.command.trim().length > 0) {
-		return { kind: "shell", command: value.command.trim() };
-	}
-
-	if (
-		value.kind === "exec" &&
-		typeof value.command === "string" &&
-		value.command.trim().length > 0 &&
-		Array.isArray(value.args) &&
-		value.args.every((arg) => typeof arg === "string")
-	) {
-		return {
-			kind: "exec",
-			command: value.command.trim(),
-			args: value.args,
-		};
-	}
-
-	return undefined;
+function writeJsonFile(filePath: string, value: unknown): void {
+	mkdirSync(dirname(filePath), { recursive: true });
+	writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
 }
 
-function readJsonFile(path: string): Record<string, unknown> | undefined {
-	try {
-		const content = readFileSync(path, "utf8");
-		const parsed = JSON.parse(content) as unknown;
-		return isRecord(parsed) ? parsed : undefined;
-	} catch {
-		return undefined;
-	}
-}
-
-function writeJsonFile(path: string, value: unknown): void {
-	mkdirSync(dirname(path), { recursive: true });
-	writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-}
-
-function mergeSettingsConfig(
-	base: AutoUpdateSettingsConfig,
-	override: AutoUpdateSettingsConfig,
-): AutoUpdateSettingsConfig {
-	return {
-		updateCommand: override.updateCommand ?? base.updateCommand,
-		restartCommand: override.restartCommand ?? base.restartCommand,
-	};
-}
-
-function mergeInstallMetadata(base: InstallMetadata, override: InstallMetadata): InstallMetadata {
-	return {
-		updateCommand: override.updateCommand ?? base.updateCommand,
-		restartCommand: override.restartCommand ?? base.restartCommand,
-		installMethod: override.installMethod ?? base.installMethod,
-	};
+function writeTextFile(filePath: string, content: string): void {
+	mkdirSync(dirname(filePath), { recursive: true });
+	writeFileSync(filePath, content, "utf8");
 }
 
 class UpdateStateRepository {
@@ -268,24 +159,14 @@ class UpdateStateRepository {
 	read(): UpdateState {
 		try {
 			const content = readFileSync(this.stateFile, "utf8");
-			const parsed = JSON.parse(content) as Record<string, unknown>;
-			const validatedAt = typeof parsed.validatedAt === "number" ? parsed.validatedAt : undefined;
-			const legacyValidated = validatedAt !== undefined;
+			const parsed = JSON.parse(content) as UpdateState;
 			return {
 				lastCheckedAt: typeof parsed.lastCheckedAt === "number" ? parsed.lastCheckedAt : undefined,
 				latestVersion: typeof parsed.latestVersion === "string" ? parsed.latestVersion : undefined,
 				skippedVersion: typeof parsed.skippedVersion === "string" ? parsed.skippedVersion : undefined,
-				validatedUpdateCommand:
-					parseCommandSpec(parsed.validatedUpdateCommand) ??
-					(legacyValidated ? parseCommandSpec(parsed.updateCommand) : undefined),
-				validatedRestartCommand:
-					parseCommandSpec(parsed.validatedRestartCommand) ??
-					(legacyValidated ? parseCommandSpec(parsed.restartCommand) : undefined),
-				validatedInstallMethod:
-					parseInstallMethod(parsed.validatedInstallMethod) ??
-					(legacyValidated ? parseInstallMethod(parsed.installMethod) : undefined),
-				validatedAt,
-				lastUpdatedVersion: typeof parsed.lastUpdatedVersion === "string" ? parsed.lastUpdatedVersion : undefined,
+				installMethod: parseInstallMethod(parsed.installMethod),
+				updateCommand: typeof parsed.updateCommand === "string" ? parsed.updateCommand : undefined,
+				restartCommand: typeof parsed.restartCommand === "string" ? parsed.restartCommand : undefined,
 			};
 		} catch {
 			return {};
@@ -312,54 +193,62 @@ class UpdateStateRepository {
 }
 
 class WindowsUpdateStatusRepository {
-	constructor(private readonly statusFile: string) {}
+	constructor(
+		private readonly statusFile: string,
+		private readonly agentDir: string,
+	) {}
 
 	read(): WindowsUpdateStatus | undefined {
-		const parsed = readJsonFile(this.statusFile);
-		if (!parsed) {
+		try {
+			const parsed = JSON.parse(readFileSync(this.statusFile, "utf8")) as unknown;
+			if (!isRecord(parsed)) {
+				return undefined;
+			}
+
+			const phase = parseUpdatePhase(parsed.phase);
+			const mode = parseWindowsUpdateMode(parsed.mode);
+			if (
+				typeof parsed.updateId !== "string" ||
+				parsed.updateId.trim().length === 0 ||
+				!phase ||
+				typeof parsed.latestVersion !== "string" ||
+				parsed.latestVersion.trim().length === 0 ||
+				!mode ||
+				typeof parsed.updateCommandDisplay !== "string" ||
+				parsed.updateCommandDisplay.trim().length === 0 ||
+				typeof parsed.logFile !== "string" ||
+				parsed.logFile.trim().length === 0 ||
+				typeof parsed.scheduledAt !== "number" ||
+				typeof parsed.lastTransitionAt !== "number"
+			) {
+				return undefined;
+			}
+
+			return {
+				updateId: parsed.updateId,
+				phase,
+				latestVersion: parsed.latestVersion,
+				mode,
+				updateCommandDisplay: parsed.updateCommandDisplay,
+				restartCommandDisplay:
+					typeof parsed.restartCommandDisplay === "string" ? parsed.restartCommandDisplay : undefined,
+				logFile: parsed.logFile,
+				error: typeof parsed.error === "string" ? parsed.error : undefined,
+				scheduledAt: parsed.scheduledAt,
+				lastTransitionAt: parsed.lastTransitionAt,
+				updatedAt: typeof parsed.updatedAt === "number" ? parsed.updatedAt : undefined,
+				completedAt: typeof parsed.completedAt === "number" ? parsed.completedAt : undefined,
+				failedAt: typeof parsed.failedAt === "number" ? parsed.failedAt : undefined,
+			};
+		} catch {
 			return undefined;
 		}
-
-		const phase = parseUpdatePhase(parsed.phase);
-		const mode = parseWindowsUpdateMode(parsed.mode);
-		if (
-			typeof parsed.updateId !== "string" ||
-			parsed.updateId.trim().length === 0 ||
-			!phase ||
-			typeof parsed.latestVersion !== "string" ||
-			parsed.latestVersion.trim().length === 0 ||
-			!mode ||
-			typeof parsed.updateCommandDisplay !== "string" ||
-			parsed.updateCommandDisplay.trim().length === 0 ||
-			typeof parsed.logFile !== "string" ||
-			parsed.logFile.trim().length === 0 ||
-			typeof parsed.scheduledAt !== "number" ||
-			typeof parsed.lastTransitionAt !== "number"
-		) {
-			return undefined;
-		}
-
-		return {
-			updateId: parsed.updateId,
-			phase,
-			latestVersion: parsed.latestVersion,
-			mode,
-			updateCommandDisplay: parsed.updateCommandDisplay,
-			restartCommandDisplay:
-				typeof parsed.restartCommandDisplay === "string" ? parsed.restartCommandDisplay : undefined,
-			logFile: parsed.logFile,
-			error: typeof parsed.error === "string" ? parsed.error : undefined,
-			scheduledAt: parsed.scheduledAt,
-			lastTransitionAt: parsed.lastTransitionAt,
-			updatedAt: typeof parsed.updatedAt === "number" ? parsed.updatedAt : undefined,
-			completedAt: typeof parsed.completedAt === "number" ? parsed.completedAt : undefined,
-			failedAt: typeof parsed.failedAt === "number" ? parsed.failedAt : undefined,
-		};
 	}
 
 	write(status: WindowsUpdateStatus): void {
 		try {
-			writeJsonFile(this.statusFile, status);
+			mkdirSync(this.agentDir, { recursive: true });
+			writeFileSync(this.statusFile, `${JSON.stringify(status, null, 2)}\n`, "utf8");
 		} catch {
 			// Best-effort only. Failing to persist status should not break pi startup.
 		}
@@ -378,14 +267,49 @@ class VersionService {
 	constructor(private readonly stateRepository: UpdateStateRepository) {}
 
 	compare(a: string, b: string): number {
-		const left = this.normalizeVersion(a);
-		const right = this.normalizeVersion(b);
+		const normalize = (version: string): { parts: number[]; prerelease?: string } => {
+			const trimmed = version.trim().replace(/^v/i, "");
+			const [core, prerelease] = trimmed.split("-", 2);
+			const parts = core.split(".").map((part) => Number.parseInt(part, 10) || 0);
+			return { parts, prerelease };
+		};
 
-		if (left && right) {
-			return compareSemver(left, right);
+		const left = normalize(a);
+		const right = normalize(b);
+		const length = Math.max(left.parts.length, right.parts.length);
+
+		for (let index = 0; index < length; index += 1) {
+			const diff = (left.parts[index] ?? 0) - (right.parts[index] ?? 0);
+			if (diff !== 0) {
+				return diff;
+			}
 		}
 
-		return a.trim().localeCompare(b.trim(), undefined, { numeric: true, sensitivity: "base" });
+		if (left.prerelease === right.prerelease) return 0;
+		if (!left.prerelease && right.prerelease) return 1;
+		if (left.prerelease && !right.prerelease) return -1;
+
+		return (left.prerelease ?? "").localeCompare(right.prerelease ?? "", undefined, { numeric: true });
+	}
+
+	isDifferentFromCurrent(latestVersion: string, currentVersion: string): boolean {
+		return latestVersion.trim() !== currentVersion.trim();
+	}
+
+	hasNewerVersion(latestVersion: string, currentVersion: string): boolean {
+		if (!this.isDifferentFromCurrent(latestVersion, currentVersion)) {
+			return false;
+		}
+
+		return this.compare(latestVersion, currentVersion) > 0;
+	}
+
+	isSameOrNewer(candidateVersion: string, baselineVersion: string): boolean {
+		if (!this.isDifferentFromCurrent(candidateVersion, baselineVersion)) {
+			return true;
+		}
+
+		return this.compare(candidateVersion, baselineVersion) >= 0;
 	}
 
 	async fetchLatest(): Promise<string | undefined> {
@@ -423,69 +347,61 @@ class VersionService {
 			return undefined;
 		}
 	}
-
-	isSameOrNewer(candidateVersion: string, baselineVersion: string): boolean {
-		return this.compare(candidateVersion, baselineVersion) >= 0;
-	}
-
-	private normalizeVersion(version: string): string | undefined {
-		const trimmed = version.trim();
-		return validSemver(trimmed) ?? validSemver(trimmed.replace(/^v/i, "")) ?? undefined;
-	}
 }
 
 class InstallStrategyResolver {
 	constructor(private readonly stateRepository: UpdateStateRepository) {}
 
-	resolveUpdateCommand(cwd: string): ResolvedUpdateCommand | undefined {
-		const envCommand = process.env.PI_AUTO_UPDATE_COMMAND?.trim();
-		if (envCommand) {
-			return {
-				command: { kind: "shell", command: envCommand },
-				source: "env",
-			};
+	detectMethod(): InstallMethod {
+		const haystack = [process.execPath, process.argv[0] ?? "", process.argv[1] ?? ""].join("\0").toLowerCase();
+
+		if (haystack.includes("/pnpm/") || haystack.includes("/.pnpm/") || haystack.includes("\\pnpm\\")) {
+			return "pnpm";
+		}
+		if (haystack.includes("/yarn/") || haystack.includes("/.yarn/") || haystack.includes("\\yarn\\")) {
+			return "yarn";
+		}
+		if (process.versions.bun) {
+			return "bun";
+		}
+		if (
+			haystack.includes("/npm/") ||
+			haystack.includes("/node_modules/") ||
+			haystack.includes("\\npm\\") ||
+			haystack.includes("\\node_modules\\")
+		) {
+			return "npm";
 		}
 
-		const settings = this.getSettingsConfig(cwd);
-		if (settings.updateCommand) {
-			return {
-				command: settings.updateCommand,
-				source: "settings",
-			};
+		return "unknown";
+	}
+
+	getUpdateCommand(): CommandSpec | undefined {
+		const envCommand = process.env.PI_AUTO_UPDATE_COMMAND?.trim();
+		if (envCommand) {
+			return { kind: "shell", command: envCommand };
 		}
 
 		const state = this.stateRepository.read();
-		if (state.validatedUpdateCommand) {
-			return {
-				command: state.validatedUpdateCommand,
-				source: "state",
-				installMethod: state.validatedInstallMethod,
-			};
+		if (state.updateCommand?.trim()) {
+			return { kind: "shell", command: state.updateCommand.trim() };
 		}
 
-		const metadata = this.getInstallMetadata(cwd);
-		if (metadata.updateCommand) {
-			return {
-				command: metadata.updateCommand,
-				source: "install-metadata",
-				installMethod: metadata.installMethod,
-			};
+		if (state.installMethod) {
+			const commandFromState = this.commandForMethod(state.installMethod);
+			if (commandFromState) {
+				return commandFromState;
+			}
 		}
 
-		const heuristicMethod = this.detectMethod();
-		const heuristicCommand = this.commandForMethod(heuristicMethod);
-		if (heuristicCommand) {
-			return {
-				command: heuristicCommand,
-				source: "heuristic",
-				installMethod: heuristicMethod,
-			};
-		}
-
-		return undefined;
+		return this.commandForMethod(this.detectMethod());
 	}
 
-	resolveRestartCommand(cwd: string): RestartCommandResolution {
+	getRestartCommand(): CommandSpec {
+		return this.getRestartCommandResolution().command;
+	}
+
+	getRestartCommandResolution(): RestartCommandResolution {
 		const envCommand = process.env.PI_AUTO_UPDATE_RESTART_COMMAND?.trim();
 		if (envCommand) {
 			return {
@@ -495,30 +411,12 @@ class InstallStrategyResolver {
 			};
 		}
 
-		const settings = this.getSettingsConfig(cwd);
-		if (settings.restartCommand) {
-			return {
-				command: settings.restartCommand,
-				source: "settings",
-				autoRestartAllowed: true,
-			};
-		}
-
 		const state = this.stateRepository.read();
-		if (state.validatedRestartCommand) {
+		if (state.restartCommand?.trim()) {
 			return {
-				command: state.validatedRestartCommand,
+				command: { kind: "shell", command: state.restartCommand.trim() },
 				source: "state",
 				autoRestartAllowed: process.platform !== "win32",
-			};
-		}
-
-		const metadata = this.getInstallMetadata(cwd);
-		if (metadata.restartCommand) {
-			return {
-				command: metadata.restartCommand,
-				source: "install-metadata",
-				autoRestartAllowed: true,
 			};
 		}
 
@@ -544,90 +442,6 @@ class InstallStrategyResolver {
 		return [command.command, ...command.args].join(" ");
 	}
 
-	private detectMethod(): InstallMethod {
-		const userAgent = process.env.npm_config_user_agent?.toLowerCase() ?? "";
-		if (userAgent.startsWith("pnpm/")) {
-			return "pnpm";
-		}
-		if (userAgent.startsWith("yarn/")) {
-			return "yarn";
-		}
-		if (userAgent.startsWith("bun/")) {
-			return "bun";
-		}
-		if (userAgent.startsWith("npm/")) {
-			return "npm";
-		}
-
-		const haystack = [process.execPath, process.argv[0] ?? "", process.argv[1] ?? ""].join("\0").toLowerCase();
-		if (haystack.includes("/pnpm/") || haystack.includes("/.pnpm/") || haystack.includes("\\pnpm\\")) {
-			return "pnpm";
-		}
-		if (haystack.includes("/yarn/") || haystack.includes("/.yarn/") || haystack.includes("\\yarn\\")) {
-			return "yarn";
-		}
-		if (process.versions.bun) {
-			return "bun";
-		}
-		if (
-			haystack.includes("/npm/") ||
-			haystack.includes("/node_modules/") ||
-			haystack.includes("\\npm\\") ||
-			haystack.includes("\\node_modules\\")
-		) {
-			return "npm";
-		}
-
-		return "unknown";
-	}
-
-	private getSettingsConfig(cwd: string): AutoUpdateSettingsConfig {
-		const settingsManager = SettingsManager.create(cwd, getAgentDir());
-		const globalConfig = this.parseSettingsConfig(settingsManager.getGlobalSettings() as unknown);
-		const projectConfig = this.parseSettingsConfig(settingsManager.getProjectSettings() as unknown);
-		return mergeSettingsConfig(globalConfig, projectConfig);
-	}
-
-	private parseSettingsConfig(value: unknown): AutoUpdateSettingsConfig {
-		if (!isRecord(value)) {
-			return {};
-		}
-
-		const rawConfig = isRecord(value.piAutoUpdate)
-			? value.piAutoUpdate
-			: isRecord(value.autoUpdate)
-				? value.autoUpdate
-				: undefined;
-		if (!rawConfig) {
-			return {};
-		}
-
-		return {
-			updateCommand: parseCommandSpec(rawConfig.updateCommand),
-			restartCommand: parseCommandSpec(rawConfig.restartCommand),
-		};
-	}
-
-	private getInstallMetadata(cwd: string): InstallMetadata {
-		const globalMetadata = this.parseInstallMetadata(readJsonFile(join(getAgentDir(), INSTALL_METADATA_FILE_NAME)));
-		const projectMetadata = this.parseInstallMetadata(readJsonFile(join(cwd, ".pi", INSTALL_METADATA_FILE_NAME)));
-		return mergeInstallMetadata(globalMetadata, projectMetadata);
-	}
-
-	private parseInstallMetadata(value: Record<string, unknown> | undefined): InstallMetadata {
-		if (!value) {
-			return {};
-		}
-
-		const installMethod = parseInstallMethod(value.installMethod);
-		return {
-			installMethod,
-			updateCommand:
-				parseCommandSpec(value.updateCommand) ?? (installMethod ? this.commandForMethod(installMethod) : undefined),
-			restartCommand: parseCommandSpec(value.restartCommand),
-		};
-	}
-
 	private commandForMethod(method: InstallMethod): CommandSpec | undefined {
 		switch (method) {
 			case "pnpm":
@@ -650,29 +464,28 @@ class UpdateScheduler {
 		private readonly windowsStatusRepository: WindowsUpdateStatusRepository,
 	) {}
 
-	scheduleForPosix(latestVersion: string, ctx: UIContext): ScheduleResult {
-		if (!existsSync(RUNNER_FILE)) {
+	scheduleForPosix(latestVersion: string, ctx: UIContext): boolean {
+		const updateCommand = this.installStrategyResolver.getUpdateCommand();
+		if (!updateCommand) {
 			ctx.ui.notify(
-				`Auto-update runner not found: ${RUNNER_FILE}. Copy the full auto-update extension directory.`,
+				"Could not determine a safe pi update command. Set PI_AUTO_UPDATE_COMMAND to enable auto-update.",
 				"warning",
 			);
-			return { scheduled: false };
+			return false;
 		}
 
-		const resolvedUpdate = this.installStrategyResolver.resolveUpdateCommand(ctx.cwd);
-		if (!resolvedUpdate) {
-			ctx.ui.notify(
-				"Could not determine a safe pi update command. Configure PI_AUTO_UPDATE_COMMAND, add piAutoUpdate.updateCommand to settings.json, or provide install metadata.",
-				"warning",
-			);
-			return { scheduled: false };
-		}
-
-		const resolvedRestart = this.installStrategyResolver.resolveRestartCommand(ctx.cwd);
-		const payload = this.buildPosixPayload(latestVersion, ctx.cwd, resolvedUpdate, resolvedRestart.command);
+		const restartCommand = this.installStrategyResolver.getRestartCommand();
+		const payload: ScheduledUpdatePayload = {
+			parentPid: process.pid,
+			cwd: ctx.cwd,
+			latestVersion,
+			updateCommand,
+			restartCommand,
+			updateCommandDisplay: this.installStrategyResolver.formatCommand(updateCommand),
+		};
 
 		try {
-			const child = spawn(process.execPath, [RUNNER_FILE, this.encodePayload(payload)], {
+			const child = spawn(process.execPath, ["-e", this.buildRunnerScript(payload)], {
 				detached: true,
 				stdio: "inherit",
 				env: process.env,
@@ -680,70 +493,65 @@ class UpdateScheduler {
 			child.unref();
 			ctx.ui.notify(`pi will exit, update to ${latestVersion}, then restart automatically.`, "info");
 			ctx.shutdown();
-			return {
-				scheduled: true,
-				updateCommand: resolvedUpdate.command,
-				restartCommand: resolvedRestart.command,
-			};
+			return true;
 		} catch (error: unknown) {
 			const message = error instanceof Error ? error.message : String(error);
 			ctx.ui.notify(`Failed to schedule pi restart: ${message}`, "error");
-			return { scheduled: false };
+			return false;
 		}
 	}
 
-	scheduleForWindows(latestVersion: string, ctx: UIContext): ScheduleResult {
-		if (!existsSync(RUNNER_FILE)) {
+	scheduleForWindows(latestVersion: string, ctx: UIContext): boolean {
+		const updateCommand = this.installStrategyResolver.getUpdateCommand();
+		if (!updateCommand) {
 			ctx.ui.notify(
-				`Auto-update runner not found: ${RUNNER_FILE}. Copy the full auto-update extension directory.`,
+				"Could not determine a safe pi update command. Set PI_AUTO_UPDATE_COMMAND to enable auto-update.",
 				"warning",
 			);
-			return { scheduled: false };
+			return false;
 		}
 
-		const resolvedUpdate = this.installStrategyResolver.resolveUpdateCommand(ctx.cwd);
-		if (!resolvedUpdate) {
-			ctx.ui.notify(
-				"Could not determine a safe pi update command. Configure PI_AUTO_UPDATE_COMMAND, add piAutoUpdate.updateCommand to settings.json, or provide install metadata.",
-				"warning",
-			);
-			return { scheduled: false };
-		}
-
-		const resolvedRestart = this.installStrategyResolver.resolveRestartCommand(ctx.cwd);
-		const mode: WindowsUpdateMode = resolvedRestart.autoRestartAllowed
+		const restartResolution = this.installStrategyResolver.getRestartCommandResolution();
+		const mode: WindowsUpdateMode = restartResolution.autoRestartAllowed
 			? "helper-update-and-restart"
 			: "helper-update-only";
 		const updateId = randomUUID();
 		const logFile = join(WINDOWS_LOG_DIR, `pi-auto-update-${updateId}.log`);
 		const payloadFile = join(WINDOWS_PAYLOAD_DIR, `pi-auto-update-${updateId}.json`);
+		const updateCommandDisplay = this.installStrategyResolver.formatCommand(updateCommand);
+		const restartCommandDisplay = this.installStrategyResolver.formatCommand(restartResolution.command);
 		const scheduledAt = Date.now();
 		const scheduledStatus: WindowsUpdateStatus = {
 			updateId,
 			phase: "scheduled",
 			latestVersion,
 			mode,
-			updateCommandDisplay: this.installStrategyResolver.formatCommand(resolvedUpdate.command),
-			restartCommandDisplay: this.installStrategyResolver.formatCommand(resolvedRestart.command),
+			updateCommandDisplay,
+			restartCommandDisplay,
 			logFile,
 			scheduledAt,
 			lastTransitionAt: scheduledAt,
 		};
-		const payload = this.buildWindowsPayload(
+		const payload: WindowsUpdatePayload = {
 			updateId,
+			parentPid: process.pid,
+			cwd: ctx.cwd,
 			latestVersion,
-			ctx.cwd,
-			resolvedUpdate,
-			resolvedRestart,
 			mode,
+			updateCommand,
+			restartCommand: restartResolution.command,
+			statusFile: STATUS_FILE,
 			logFile,
-		);
+			updateCommandDisplay,
+			restartCommandDisplay,
+		};
 
 		try {
+			writeTextFile(WINDOWS_HELPER_FILE, this.buildWindowsHelperScript());
 			writeJsonFile(payloadFile, payload);
 			this.windowsStatusRepository.write(scheduledStatus);
 
-			const child = spawn(process.execPath, [RUNNER_FILE, "--windows-payload", payloadFile], {
+			const child = spawn(process.execPath, [WINDOWS_HELPER_FILE, payloadFile], {
 				detached: true,
 				stdio: "ignore",
 				windowsHide: true,
@@ -763,11 +571,7 @@ class UpdateScheduler {
 				);
 			}
 			ctx.shutdown();
-			return {
-				scheduled: true,
-				updateCommand: resolvedUpdate.command,
-				restartCommand: resolvedRestart.command,
-			};
+			return true;
 		} catch (error: unknown) {
 			const message = error instanceof Error ? error.message : String(error);
 			this.windowsStatusRepository.write({
@@ -778,56 +582,313 @@ class UpdateScheduler {
 				lastTransitionAt: Date.now(),
 			});
 			ctx.ui.notify(`Failed to schedule the Windows updater: ${message}`, "error");
-			return { scheduled: false };
+			return false;
 		}
 	}
 
-	private buildPosixPayload(
-		latestVersion: string,
-		cwd: string,
-		resolvedUpdate: ResolvedUpdateCommand,
-		restartCommand: CommandSpec,
-	): ScheduledUpdatePayload {
+	private buildRunnerScript(payload: ScheduledUpdatePayload): string {
+		const serializedPayload = JSON.stringify(payload);
+		return [
+			`const payload = ${serializedPayload};`,
+			"const { spawn } = require('node:child_process');",
+			"const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));",
+			"async function waitForParentExit(pid) {",
+			"  while (true) {",
+			"    try {",
+			"      process.kill(pid, 0);",
+			"      await delay(200);",
+			"    } catch {",
+			"      return;",
+			"    }",
+			"  }",
+			"}",
+			"function runCommand(spec, cwd, waitForExit) {",
+			"  return new Promise((resolve, reject) => {",
+			"    const options = { cwd, stdio: 'inherit', env: process.env, shell: false };",
+			"    const child = spec.kind === 'shell' ? spawn('sh', ['-lc', spec.command], options) : spawn(spec.command, spec.args, options);",
+			"    child.on('error', reject);",
+			"    if (!waitForExit) {",
+			"      child.unref();",
+			"      resolve(0);",
+			"      return;",
+			"    }",
+			"    child.on('close', (code) => resolve(code ?? 0));",
+			"  });",
+			"}",
+			"(async () => {",
+			"  await waitForParentExit(payload.parentPid);",
+			"  console.log('\\nUpdating pi to ' + payload.latestVersion + '...');",
+			"  const updateCode = await runCommand(payload.updateCommand, payload.cwd, true);",
+			"  if (updateCode !== 0) {",
+			"    console.error('\\npi auto-update failed. Run manually: ' + payload.updateCommandDisplay);",
+			"    process.exit(updateCode);",
+			"  }",
+			"  console.log('\\npi updated successfully. Restarting...');",
+			"  await runCommand(payload.restartCommand, payload.cwd, false);",
+			"  process.exit(0);",
+			"})().catch((error) => {",
+			"  console.error(error instanceof Error ? error.message : String(error));",
+			"  process.exit(1);",
+			"});",
+		].join("\n");
+	}
+
+	private buildWindowsHelperScript(): string {
+		return String.raw`#!/usr/bin/env node
+
+const { spawn } = require("node:child_process");
+const { appendFileSync, mkdirSync, readFileSync, writeFileSync } = require("node:fs");
+const { dirname } = require("node:path");
+
+function delay(ms) {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRecord(value) {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function mkdirForFile(filePath) {
+	mkdirSync(dirname(filePath), { recursive: true });
+}
+
+function writeJsonFile(filePath, value) {
+	mkdirForFile(filePath);
+	writeFileSync(filePath, JSON.stringify(value, null, 2) + "\n", "utf8");
+}
+
+function appendLog(logFile, message) {
+	mkdirForFile(logFile);
+	appendFileSync(logFile, "[" + new Date().toISOString() + "] " + message + "\n", "utf8");
+}
+
+function parseCommandSpec(value) {
+	if (!isRecord(value)) {
+		throw new Error("Invalid command spec");
+	}
+
+	if (value.kind === "shell" && typeof value.command === "string" && value.command.trim().length > 0) {
 		return {
-			parentPid: process.pid,
-			cwd,
-			stateFile: STATE_FILE,
-			latestVersion,
-			updateCommand: resolvedUpdate.command,
-			restartCommand,
-			updateCommandDisplay: this.installStrategyResolver.formatCommand(resolvedUpdate.command),
-			validatedInstallMethod: resolvedUpdate.installMethod,
+			kind: "shell",
+			command: value.command.trim(),
 		};
 	}
 
-	private buildWindowsPayload(
-		updateId: string,
-		latestVersion: string,
-		cwd: string,
-		resolvedUpdate: ResolvedUpdateCommand,
-		resolvedRestart: RestartCommandResolution,
-		mode: WindowsUpdateMode,
-		logFile: string,
-	): WindowsUpdatePayload {
+	if (
+		value.kind === "exec" &&
+		typeof value.command === "string" &&
+		value.command.trim().length > 0 &&
+		Array.isArray(value.args) &&
+		value.args.every((arg) => typeof arg === "string")
+	) {
 		return {
-			updateId,
-			parentPid: process.pid,
-			cwd,
-			stateFile: STATE_FILE,
-			statusFile: STATUS_FILE,
-			latestVersion,
-			mode,
-			updateCommand: resolvedUpdate.command,
-			restartCommand: resolvedRestart.command,
-			updateCommandDisplay: this.installStrategyResolver.formatCommand(resolvedUpdate.command),
-			restartCommandDisplay: this.installStrategyResolver.formatCommand(resolvedRestart.command),
-			logFile,
-			validatedInstallMethod: resolvedUpdate.installMethod,
+			kind: "exec",
+			command: value.command.trim(),
+			args: value.args,
 		};
 	}
 
-	private encodePayload(payload: ScheduledUpdatePayload): string {
-		return Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+	throw new Error("Invalid command spec");
+}
+
+function loadPayload(payloadFile) {
+	const parsed = JSON.parse(readFileSync(payloadFile, "utf8"));
+	if (!isRecord(parsed)) {
+		throw new Error("Invalid Windows auto-update payload");
+	}
+
+	if (
+		typeof parsed.updateId !== "string" ||
+		parsed.updateId.trim().length === 0 ||
+		typeof parsed.parentPid !== "number" ||
+		!Number.isInteger(parsed.parentPid) ||
+		parsed.parentPid <= 0 ||
+		typeof parsed.cwd !== "string" ||
+		parsed.cwd.trim().length === 0 ||
+		typeof parsed.latestVersion !== "string" ||
+		parsed.latestVersion.trim().length === 0 ||
+		(parsed.mode !== "helper-update-only" && parsed.mode !== "helper-update-and-restart") ||
+		typeof parsed.statusFile !== "string" ||
+		parsed.statusFile.trim().length === 0 ||
+		typeof parsed.logFile !== "string" ||
+		parsed.logFile.trim().length === 0 ||
+		typeof parsed.updateCommandDisplay !== "string" ||
+		parsed.updateCommandDisplay.trim().length === 0 ||
+		typeof parsed.restartCommandDisplay !== "string" ||
+		parsed.restartCommandDisplay.trim().length === 0
+	) {
+		throw new Error("Invalid Windows auto-update payload");
+	}
+
+	return {
+		updateId: parsed.updateId,
+		parentPid: parsed.parentPid,
+		cwd: parsed.cwd,
+		latestVersion: parsed.latestVersion,
+		mode: parsed.mode,
+		updateCommand: parseCommandSpec(parsed.updateCommand),
+		restartCommand: parseCommandSpec(parsed.restartCommand),
+		statusFile: parsed.statusFile,
+		logFile: parsed.logFile,
+		updateCommandDisplay: parsed.updateCommandDisplay,
+		restartCommandDisplay: parsed.restartCommandDisplay,
+	};
+}
+
+function readStatus(statusFile) {
+	try {
+		const parsed = JSON.parse(readFileSync(statusFile, "utf8"));
+		return isRecord(parsed) ? parsed : {};
+	} catch {
+		return {};
+	}
+}
+
+function writeStatus(payload, patch) {
+	const current = readStatus(payload.statusFile);
+	const nextStatus = {
+		...current,
+		updateId: payload.updateId,
+		latestVersion: payload.latestVersion,
+		mode: payload.mode,
+		updateCommandDisplay: payload.updateCommandDisplay,
+		restartCommandDisplay: payload.restartCommandDisplay,
+		logFile: payload.logFile,
+		...patch,
+		lastTransitionAt: Date.now(),
+	};
+	writeJsonFile(payload.statusFile, nextStatus);
+}
+
+async function waitForParentExit(parentPid, logFile) {
+	while (true) {
+		try {
+			process.kill(parentPid, 0);
+			await delay(200);
+		} catch (error) {
+			if (error && typeof error === "object" && error.code === "ESRCH") {
+				return;
+			}
+			appendLog(logFile, "waitForParentExit continuing after error: " + (error instanceof Error ? error.message : String(error)));
+			return;
+		}
+	}
+}
+
+function quoteWindowsArg(arg) {
+	if (arg.length === 0) {
+		return '""';
+	}
+	if (!/[\s"]/u.test(arg)) {
+		return arg;
+	}
+	return '"' + arg.replace(/(\\*)"/g, "$1$1\\\"").replace(/(\\+)$/g, "$1$1") + '"';
+}
+
+function toWindowsCommandLine(spec) {
+	if (spec.kind === "shell") {
+		return spec.command;
+	}
+
+	return [quoteWindowsArg(spec.command), ...spec.args.map((arg) => quoteWindowsArg(arg))].join(" ");
+}
+
+function runWindowsCommand(spec, cwd, waitForExit) {
+	return new Promise((resolve, reject) => {
+		const commandLine = toWindowsCommandLine(spec);
+		const child = spawn(process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", commandLine], {
+			cwd,
+			env: process.env,
+			stdio: "ignore",
+			shell: false,
+			windowsHide: true,
+			detached: !waitForExit,
+		});
+		child.on("error", reject);
+		if (!waitForExit) {
+			child.unref();
+			resolve(0);
+			return;
+		}
+		child.on("close", (code) => resolve(code ?? 0));
+	});
+}
+
+async function main() {
+	const payloadFile = process.argv[2];
+	if (!payloadFile) {
+		throw new Error("Missing Windows auto-update payload path");
+	}
+
+	const payload = loadPayload(payloadFile);
+	appendLog(payload.logFile, "Windows updater helper started for version " + payload.latestVersion + ".");
+	writeStatus(payload, {
+		phase: "updating",
+		error: undefined,
+	});
+
+	appendLog(payload.logFile, "Waiting for pi process " + payload.parentPid + " to exit.");
+	await waitForParentExit(payload.parentPid, payload.logFile);
+	appendLog(payload.logFile, "pi process exited. Running update command: " + payload.updateCommandDisplay);
+
+	const updateCode = await runWindowsCommand(payload.updateCommand, payload.cwd, true);
+	if (updateCode !== 0) {
+		const errorMessage = "Update command failed with exit code " + updateCode + ". Run manually: " + payload.updateCommandDisplay;
+		appendLog(payload.logFile, errorMessage);
+		writeStatus(payload, {
+			phase: "failed",
+			error: errorMessage,
+			failedAt: Date.now(),
+		});
+		process.exit(updateCode || 1);
+	}
+
+	appendLog(payload.logFile, "Update command completed successfully.");
+	writeStatus(payload, {
+		phase: "updated",
+		error: undefined,
+		updatedAt: Date.now(),
+	});
+
+	if (payload.mode === "helper-update-only") {
+		appendLog(payload.logFile, "Update completed. Automatic restart disabled; restart pi manually.");
+		return;
+	}
+
+	appendLog(payload.logFile, "Launching restart command: " + payload.restartCommandDisplay);
+	writeStatus(payload, {
+		phase: "restarting",
+		error: undefined,
+	});
+
+	try {
+		await runWindowsCommand(payload.restartCommand, payload.cwd, false);
+		appendLog(payload.logFile, "Restart command launched successfully.");
+		writeStatus(payload, {
+			phase: "completed",
+			error: undefined,
+			completedAt: Date.now(),
+		});
+		return;
+	} catch (error) {
+		const errorMessage = "Restart command failed: " + (error instanceof Error ? error.message : String(error));
+		appendLog(payload.logFile, errorMessage);
+		writeStatus(payload, {
+			phase: "failed",
+			error: errorMessage,
+			failedAt: Date.now(),
+		});
+		throw error;
+	}
+}
+
+if (require.main === module) {
+	main().catch((error) => {
+		console.error(error instanceof Error ? error.message : String(error));
+		process.exit(1);
+	});
+}
+`;
 	}
 }
 
@@ -838,7 +899,6 @@ class ChangelogViewer implements Component {
 	constructor(
 		private readonly tui: TUI,
 		private readonly theme: Theme,
-		private readonly keybindings: KeybindingsManager,
 		private readonly title: string,
 		markdownText: string,
 		private readonly onClose: () => void,
@@ -851,37 +911,37 @@ class ChangelogViewer implements Component {
 		const contentHeight = this.markdown.render(this.tui.terminal.columns).length;
 		const maxScroll = Math.max(0, contentHeight - pageSize);
 
-		if (this.matchesAny(data, ["tui.select.cancel", "tui.select.confirm"])) {
+		if (matchesKey(data, "escape") || matchesKey(data, "enter") || data === "q") {
 			this.onClose();
 			return;
 		}
 
-		if (this.keybindings.matches(data, "tui.select.down")) {
+		if (matchesKey(data, "down")) {
 			this.scrollOffset = Math.min(maxScroll, this.scrollOffset + 1);
 			this.tui.requestRender();
 			return;
 		}
-		if (this.keybindings.matches(data, "tui.select.up")) {
+		if (matchesKey(data, "up")) {
 			this.scrollOffset = Math.max(0, this.scrollOffset - 1);
 			this.tui.requestRender();
 			return;
 		}
-		if (this.keybindings.matches(data, "tui.select.pageDown")) {
+		if (matchesKey(data, "pageDown")) {
 			this.scrollOffset = Math.min(maxScroll, this.scrollOffset + pageSize);
 			this.tui.requestRender();
 			return;
 		}
-		if (this.keybindings.matches(data, "tui.select.pageUp")) {
+		if (matchesKey(data, "pageUp")) {
 			this.scrollOffset = Math.max(0, this.scrollOffset - pageSize);
 			this.tui.requestRender();
 			return;
 		}
-		if (this.keybindings.matches(data, "tui.editor.cursorLineStart")) {
+		if (matchesKey(data, "home")) {
 			this.scrollOffset = 0;
 			this.tui.requestRender();
 			return;
 		}
-		if (this.keybindings.matches(data, "tui.editor.cursorLineEnd")) {
+		if (matchesKey(data, "end")) {
 			this.scrollOffset = maxScroll;
 			this.tui.requestRender();
 		}
@@ -899,7 +959,10 @@ class ChangelogViewer implements Component {
 		}
 
 		const titleLine = truncateToWidth(this.theme.fg("accent", this.theme.bold(this.title)), width);
-		const helpLine = truncateToWidth(this.theme.fg("dim", this.getHelpText()), width);
+		const helpLine = truncateToWidth(
+			this.theme.fg("dim", "↑↓ scroll • PgUp/PgDn page • Home/End jump • Enter/Esc close"),
+			width,
+		);
 		const footerLine = truncateToWidth(
 			this.theme.fg(
 				"dim",
@@ -913,38 +976,6 @@ class ChangelogViewer implements Component {
 
 	invalidate(): void {
 		this.markdown.invalidate();
-	}
-
-	private matchesAny(data: string, bindings: readonly Keybinding[]): boolean {
-		return bindings.some((binding) => this.keybindings.matches(data, binding));
-	}
-
-	private getHelpText(): string {
-		return [
-			this.formatHelpSegment(["tui.select.up", "tui.select.down"], "scroll"),
-			this.formatHelpSegment(["tui.select.pageUp", "tui.select.pageDown"], "page"),
-			this.formatHelpSegment(["tui.editor.cursorLineStart", "tui.editor.cursorLineEnd"], "jump"),
-			this.formatHelpSegment(["tui.select.confirm", "tui.select.cancel"], "close"),
-		].join(" • ");
-	}
-
-	private formatHelpSegment(bindings: readonly Keybinding[], description: string): string {
-		const keys = this.formatBindings(bindings);
-		return keys.length > 0 ? `${keys} ${description}` : description;
-	}
-
-	private formatBindings(bindings: readonly Keybinding[]): string {
-		const keys: KeyId[] = [];
-		const seen = new Set<KeyId>();
-		for (const binding of bindings) {
-			for (const key of this.keybindings.getKeys(binding)) {
-				if (!seen.has(key)) {
-					seen.add(key);
-					keys.push(key);
-				}
-			}
-		}
-		return keys.join("/");
 	}
 
 	private getPageSize(): number {
@@ -964,8 +995,8 @@ class ChangelogService {
 			return;
 		}
 
-		await ctx.ui.custom((tui, theme, keybindings, done) => {
-			return new ChangelogViewer(tui, theme, keybindings, `Changelog ${version}`, markdown, () => done(undefined));
+		await ctx.ui.custom((tui, theme, _kb, done) => {
+			return new ChangelogViewer(tui, theme, `Changelog ${version}`, markdown, () => done(undefined));
 		});
 	}
 
@@ -1103,6 +1134,7 @@ class WindowsUpdateStatusService {
 class UpdatePromptService {
 	constructor(
 		private readonly stateRepository: UpdateStateRepository,
+		private readonly installStrategyResolver: InstallStrategyResolver,
 		private readonly updateScheduler: UpdateScheduler,
 		private readonly changelogService: ChangelogService,
 	) {}
@@ -1121,16 +1153,24 @@ class UpdatePromptService {
 
 	async handleChoice(choice: UpdateChoice, latestVersion: string, ctx: UIContext): Promise<ChoiceHandlingResult> {
 		if (choice === "update") {
-			const scheduleResult =
+			const scheduled =
 				process.platform === "win32"
 					? this.updateScheduler.scheduleForWindows(latestVersion, ctx)
 					: this.updateScheduler.scheduleForPosix(latestVersion, ctx);
-			if (scheduleResult.scheduled) {
+			if (scheduled) {
+				const updateCommand = this.installStrategyResolver.getUpdateCommand();
+				const restartCommandResolution = this.installStrategyResolver.getRestartCommandResolution();
 				this.stateRepository.write({
 					...this.stateRepository.read(),
 					lastCheckedAt: Date.now(),
 					latestVersion,
 					skippedVersion: undefined,
+					installMethod: this.installStrategyResolver.detectMethod(),
+					updateCommand: updateCommand?.kind === "shell" ? updateCommand.command : undefined,
+					restartCommand:
+						restartCommandResolution.source !== "default" && restartCommandResolution.command.kind === "shell"
+							? restartCommandResolution.command.command
+							: undefined,
 				});
 			}
 			return "done";
@@ -1205,8 +1245,15 @@ class AutoUpdateController {
 				ctx.ui.notify("Could not check for pi updates.", "warning");
 				return;
 			}
-			if (this.versionService.compare(latestVersion, VERSION) <= 0) {
+			if (!this.versionService.isDifferentFromCurrent(latestVersion, VERSION)) {
 				ctx.ui.notify(`Already on the latest version (${VERSION}).`, "info");
+				return;
+			}
+			if (!this.versionService.hasNewerVersion(latestVersion, VERSION)) {
+				ctx.ui.notify(
+					`Current version (${VERSION}) differs from npm latest (${latestVersion}), but npm latest is not newer.`,
+					"info",
+				);
 				return;
 			}
 			await this.updatePromptService.handleChoice("update", latestVersion, ctx);
@@ -1243,7 +1290,7 @@ class AutoUpdateController {
 			return;
 		}
 
-		if (this.versionService.compare(latestVersion, VERSION) <= 0) {
+		if (!this.versionService.isDifferentFromCurrent(latestVersion, VERSION)) {
 			this.stateRepository.write({
 				...this.stateRepository.read(),
 				lastCheckedAt: Date.now(),
@@ -1252,6 +1299,21 @@ class AutoUpdateController {
 			});
 			if (force) {
 				ctx.ui.notify(`Already on the latest version (${VERSION}).`, "info");
+			}
+			return;
+		}
+
+		if (!this.versionService.hasNewerVersion(latestVersion, VERSION)) {
+			this.stateRepository.write({
+				...this.stateRepository.read(),
+				lastCheckedAt: Date.now(),
+				latestVersion,
+			});
+			if (force) {
+				ctx.ui.notify(
+					`Current version (${VERSION}) differs from npm latest (${latestVersion}), but npm latest is not newer.`,
+					"info",
+				);
 			}
 			return;
 		}
@@ -1275,13 +1337,18 @@ export default function autoUpdateExtension(pi: ExtensionAPI) {
 	process.env.PI_SKIP_VERSION_CHECK = "1";
 
 	const stateRepository = new UpdateStateRepository(STATE_FILE, AGENT_DIR);
-	const windowsStatusRepository = new WindowsUpdateStatusRepository(STATUS_FILE);
+	const windowsStatusRepository = new WindowsUpdateStatusRepository(STATUS_FILE, AGENT_DIR);
 	const versionService = new VersionService(stateRepository);
 	const installStrategyResolver = new InstallStrategyResolver(stateRepository);
 	const updateScheduler = new UpdateScheduler(installStrategyResolver, windowsStatusRepository);
 	const changelogService = new ChangelogService();
 	const windowsStatusService = new WindowsUpdateStatusService(windowsStatusRepository, versionService);
-	const updatePromptService = new UpdatePromptService(stateRepository, updateScheduler, changelogService);
+	const updatePromptService = new UpdatePromptService(
+		stateRepository,
+		installStrategyResolver,
+		updateScheduler,
+		changelogService,
+	);
 	const controller = new AutoUpdateController(
 		stateRepository,
 		versionService,

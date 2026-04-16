@@ -30,6 +30,14 @@ pi will auto-discover `index.ts` from that directory.
 - `PI_AUTO_UPDATE_COMMAND` - override the update command
 - `PI_AUTO_UPDATE_RESTART_COMMAND` - override the restart command
 
+## Commands
+
+- `/update-pi` or `/update-pi check` - check for updates and prompt if available
+- `/update-pi now` - force an immediate update attempt
+- `/update-pi status` - show the persisted Windows update status, if any
+- `/update-pi clear-skip` - clear the skipped-version marker
+- `/update-pi clear-status` - clear the persisted Windows update status
+
 ## Update command resolution order
 
 The extension resolves the update command in this order:
@@ -84,9 +92,36 @@ Example:
 
 If `updateCommand` is omitted but `installMethod` is present, the extension derives the default command for that package manager.
 
+## Windows-specific behavior
+
+On Windows the extension uses a dedicated background flow:
+
+1. pi writes a payload file to `~/.pi/agent/tmp/`
+2. pi writes update status to `~/.pi/agent/pi-auto-update-status.json`
+3. `runner.cjs` continues in the background after pi exits
+4. The runner writes logs to `~/.pi/agent/logs/pi-auto-update-<id>.log`
+5. The runner either:
+   - updates and restarts pi automatically, or
+   - updates only and leaves a status message instructing you to restart manually
+
+Persisted restart commands recovered from prior validated state are not auto-executed on Windows. In that case the extension downgrades to update-only mode unless the restart command comes from:
+
+- `PI_AUTO_UPDATE_RESTART_COMMAND`
+- `settings.json`
+- install metadata
+- the built-in default restart command
+
+On next startup, the extension inspects `pi-auto-update-status.json` and reports:
+
+- failed updates
+- interrupted update flows
+- successful update-only flows that still need a restart
+- completed restart flows
+
 ## Notes
 
 - `runner.cjs` is a detached helper process used for waiting on pi to exit, performing the update, and restarting pi on both POSIX and Windows.
 - After a successful update, the runner writes the validated update and restart commands back to `~/.pi/agent/pi-auto-update.json` so future launches prefer proven commands over heuristics.
+- On Windows, background update progress is persisted separately in `~/.pi/agent/pi-auto-update-status.json` and detailed logs are written under `~/.pi/agent/logs/`.
 - The changelog viewer uses pi's configured keybindings (`tui.select.*` plus `tui.editor.cursorLineStart/cursorLineEnd`) instead of hardcoded keys.
 - `package.json` is required so the extension can carry its own `semver` dependency when copied out of the monorepo.
