@@ -61,6 +61,7 @@ cp permission-gate.ts ~/.pi/agent/extensions/
 | `modal-editor.ts` | Custom vim-like modal editor via `ctx.ui.setEditorComponent()` |
 | `rainbow-editor.ts` | Animated rainbow text effect via custom editor |
 | `notify.ts` | Desktop notifications via OSC 777 when agent finishes (Ghostty, iTerm2, WezTerm) |
+| `auto-update/` | Checks npm for newer pi versions on startup and offers “Update now” or “Skip this version”, packaged as a directory extension with a local `semver` dependency and detached runner |
 | `titlebar-spinner.ts` | Braille spinner animation in terminal title while the agent is working |
 | `summarize.ts` | Summarize conversation with GPT-5.2 and show in transient UI |
 | `custom-footer.ts` | Custom footer with git branch and token stats via `ctx.ui.setFooter()` |
