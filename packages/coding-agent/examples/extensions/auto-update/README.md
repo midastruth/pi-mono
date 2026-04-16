@@ -34,9 +34,9 @@ pi will auto-discover `index.ts` from that directory.
 
 - `/update-pi` or `/update-pi check` - check for updates and prompt if available
 - `/update-pi now` - force an immediate update attempt
-- `/update-pi status` - show the persisted Windows update status, if any
+- `/update-pi status` - show the persisted background update status, if any
 - `/update-pi clear-skip` - clear the skipped-version marker
-- `/update-pi clear-status` - clear the persisted Windows update status
+- `/update-pi clear-status` - clear the persisted background update status
 
 ## Update command resolution order
 
@@ -44,9 +44,10 @@ The extension resolves the update command in this order:
 
 1. `PI_AUTO_UPDATE_COMMAND`
 2. `piAutoUpdate.updateCommand` (or `autoUpdate.updateCommand`) in `settings.json`
-3. The last successfully validated command stored in `~/.pi/agent/pi-auto-update.json`
+3. The last successfully validated command stored in `~/.pi/agent/version.json`
 4. Install metadata from `~/.pi/agent/pi-auto-update-install.json` or `.pi/pi-auto-update-install.json`
-5. Heuristic detection (`npm_config_user_agent`, then process path hints)
+5. Detected install path (`pi` from the current environment plus `which -a`/`where`, realpath + shim probing, package-root validation against `@mariozechner/pi-coding-agent`, then global bin matching)
+6. Heuristic detection (`npm_config_user_agent`, then process path hints)
 
 If no safe command can be resolved, the extension does not auto-update and instead asks for explicit configuration.
 
@@ -92,17 +93,19 @@ Example:
 
 If `updateCommand` is omitted but `installMethod` is present, the extension derives the default command for that package manager.
 
-## Windows-specific behavior
+## Background updater behavior
 
-On Windows the extension uses a dedicated background flow:
+On all platforms the extension uses a dedicated background flow:
 
 1. pi writes a payload file to `~/.pi/agent/tmp/`
 2. pi writes update status to `~/.pi/agent/pi-auto-update-status.json`
 3. `runner.cjs` continues in the background after pi exits
 4. The runner writes logs to `~/.pi/agent/logs/pi-auto-update-<id>.log`
-5. The runner either:
-   - updates and restarts pi automatically, or
-   - updates only and leaves a status message instructing you to restart manually
+
+Platform behavior:
+
+- POSIX: updates in the background and records status/logs; restart pi manually after the update completes
+- Windows: updates in the background and either restarts pi automatically or leaves a status message instructing you to restart manually
 
 Persisted restart commands recovered from prior validated state are not auto-executed on Windows. In that case the extension downgrades to update-only mode unless the restart command comes from:
 
@@ -120,8 +123,8 @@ On next startup, the extension inspects `pi-auto-update-status.json` and reports
 
 ## Notes
 
-- `runner.cjs` is a detached helper process used for waiting on pi to exit, performing the update, and restarting pi on both POSIX and Windows.
-- After a successful update, the runner writes the validated update and restart commands back to `~/.pi/agent/pi-auto-update.json` so future launches prefer proven commands over heuristics.
-- On Windows, background update progress is persisted separately in `~/.pi/agent/pi-auto-update-status.json` and detailed logs are written under `~/.pi/agent/logs/`.
+- `runner.cjs` is a detached helper process used for waiting on pi to exit, performing the update, and writing background status/log files on both POSIX and Windows.
+- After a successful update, the runner writes the validated update and restart commands back to `~/.pi/agent/version.json` so future launches prefer proven commands over path detection and heuristics.
+- Background update progress is persisted in `~/.pi/agent/pi-auto-update-status.json` and detailed logs are written under `~/.pi/agent/logs/`.
 - The changelog viewer uses pi's configured keybindings (`tui.select.*` plus `tui.editor.cursorLineStart/cursorLineEnd`) instead of hardcoded keys.
 - `package.json` is required so the extension can carry its own `semver` dependency when copied out of the monorepo.

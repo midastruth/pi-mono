@@ -9,7 +9,7 @@
  * Notes:
  * - Suppresses pi's built-in startup version banner and replaces it with an interactive prompt.
  * - Caches the latest version for a few hours to avoid hitting npm on every launch.
- * - Stores skip state in ~/.pi/agent/pi-auto-update.json.
+ * - Stores skip state in ~/.pi/agent/version.json.
  * - Override the install command with PI_AUTO_UPDATE_COMMAND if you do not use npm.
  * - On "Update now", pi exits first, updates in a detached runner, then restarts automatically.
  *
@@ -20,11 +20,11 @@
  * 4. Optional: set PI_AUTO_UPDATE_COMMAND for pnpm/yarn/bun/custom installs
  */
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { dirname, join } from "node:path";
+import { basename, delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, Theme } from "@mariozechner/pi-coding-agent";
 import { getAgentDir, getMarkdownTheme, SettingsManager, VERSION } from "@mariozechner/pi-coding-agent";
@@ -53,7 +53,7 @@ const CHECK_TIMEOUT_MS = 10_000;
 const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const WINDOWS_STATUS_STALE_MS = 10 * 60 * 1000;
 const AGENT_DIR = getAgentDir();
-const STATE_FILE = join(AGENT_DIR, "pi-auto-update.json");
+const STATE_FILE = join(AGENT_DIR, "version.json");
 const STATUS_FILE = join(AGENT_DIR, "pi-auto-update-status.json");
 const WINDOWS_PAYLOAD_DIR = join(AGENT_DIR, "tmp");
 const WINDOWS_LOG_DIR = join(AGENT_DIR, "logs");
@@ -64,7 +64,7 @@ type UIContext = ExtensionContext | ExtensionCommandContext;
 type InstallMethod = "npm" | "pnpm" | "yarn" | "bun" | "unknown";
 type UpdateChoice = "update" | "view-changelog" | "skip" | "dismiss";
 type ChoiceHandlingResult = "continue" | "done";
-type UpdateCommandSource = "env" | "settings" | "state" | "install-metadata" | "heuristic";
+type UpdateCommandSource = "env" | "settings" | "state" | "install-metadata" | "detected-install-path" | "heuristic";
 type CommandSource = UpdateCommandSource | "default";
 type WindowsUpdateMode = "helper-update-only" | "helper-update-and-restart";
 type UpdatePhase = "scheduled" | "updating" | "updated" | "restarting" | "completed" | "failed";
@@ -116,18 +116,29 @@ interface RestartCommandResolution {
 	autoRestartAllowed: boolean;
 }
 
+interface DetectedInstall {
+	method: Exclude<InstallMethod, "unknown">;
+	binPath: string;
+	packageRoot: string;
+}
+
 interface NpmLatestResponse {
 	version?: string;
 }
 
 interface ScheduledUpdatePayload {
+	updateId: string;
 	parentPid: number;
 	cwd: string;
 	stateFile: string;
+	statusFile: string;
 	latestVersion: string;
+	mode: WindowsUpdateMode;
 	updateCommand: CommandSpec;
 	restartCommand: CommandSpec;
 	updateCommandDisplay: string;
+	restartCommandDisplay: string;
+	logFile: string;
 	validatedInstallMethod?: InstallMethod;
 }
 
@@ -257,6 +268,218 @@ function mergeInstallMetadata(base: InstallMetadata, override: InstallMetadata):
 		restartCommand: override.restartCommand ?? base.restartCommand,
 		installMethod: override.installMethod ?? base.installMethod,
 	};
+}
+
+function normalizePath(path: string): string {
+	const normalized = path.replace(/[\\/]+$/u, "");
+	return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+function pathsEqual(left: string, right: string): boolean {
+	return normalizePath(left) === normalizePath(right);
+}
+
+function addUniquePath(paths: string[], candidate: string | undefined): void {
+	if (!candidate) {
+		return;
+	}
+
+	const trimmed = candidate.trim();
+	if (trimmed.length === 0 || paths.some((existing) => pathsEqual(existing, trimmed))) {
+		return;
+	}
+	paths.push(trimmed);
+}
+
+function isPiExecutablePath(path: string): boolean {
+	const fileName = basename(path).toLowerCase();
+	return (
+		fileName === "pi" ||
+		fileName === "pi.cmd" ||
+		fileName === "pi.ps1" ||
+		fileName === "pi.exe" ||
+		fileName === "pi.bat"
+	);
+}
+
+function resolveExecutableOnPath(command: string): string | undefined {
+	const rawPath = process.env.PATH;
+	if (!rawPath) {
+		return undefined;
+	}
+
+	const pathEntries = rawPath.split(delimiter).filter((entry) => entry.trim().length > 0);
+	const windowsExtensions =
+		process.platform === "win32"
+			? (process.env.PATHEXT?.split(";").filter((entry) => entry.trim().length > 0) ?? [
+					".COM",
+					".EXE",
+					".BAT",
+					".CMD",
+					".PS1",
+				])
+			: [""];
+
+	for (const entry of pathEntries) {
+		const directCandidate = join(entry, command);
+		if (existsSync(directCandidate)) {
+			return directCandidate;
+		}
+
+		if (process.platform !== "win32") {
+			continue;
+		}
+
+		for (const extension of windowsExtensions) {
+			const candidate = join(entry, `${command}${extension}`);
+			if (existsSync(candidate)) {
+				return candidate;
+			}
+		}
+	}
+
+	return undefined;
+}
+
+function runCommandCaptureLines(command: string, args: string[]): string[] {
+	const result = spawnSync(command, args, {
+		encoding: "utf8",
+		stdio: ["ignore", "pipe", "ignore"],
+		timeout: 2_000,
+		windowsHide: true,
+	});
+	if (result.status !== 0 || typeof result.stdout !== "string") {
+		return [];
+	}
+
+	return result.stdout
+		.split(/\r?\n/u)
+		.map((line) => line.trim())
+		.filter((line) => line.length > 0 && line !== "undefined" && line !== "null");
+}
+
+function runCommandCapture(command: string, args: string[]): string | undefined {
+	return runCommandCaptureLines(command, args).at(-1);
+}
+
+function listPiExecutableCandidates(): string[] {
+	const candidates: string[] = [];
+	const currentCommand = process.env._?.trim();
+	if (currentCommand && isPiExecutablePath(currentCommand)) {
+		addUniquePath(candidates, currentCommand);
+	}
+
+	addUniquePath(candidates, resolveExecutableOnPath("pi"));
+	for (const candidate of runCommandCaptureLines(
+		process.platform === "win32" ? "where" : "which",
+		process.platform === "win32" ? ["pi"] : ["-a", "pi"],
+	)) {
+		if (isPiExecutablePath(candidate)) {
+			addUniquePath(candidates, candidate);
+		}
+	}
+
+	return candidates;
+}
+
+function collectQuotedPackageTargets(content: string, baseDir: string): string[] {
+	const targets: string[] = [];
+	const matches = content.matchAll(/["']([^"'\r\n]*@mariozechner[\\/]+pi-coding-agent[^"'\r\n]*)["']/gu);
+	for (const match of matches) {
+		const rawTarget = match[1]?.trim();
+		if (!rawTarget) {
+			continue;
+		}
+		addUniquePath(targets, resolve(baseDir, rawTarget));
+	}
+	return targets;
+}
+
+function resolveWindowsCmdShimTargets(path: string, content: string): string[] {
+	const baseDir = dirname(path);
+	const normalized = content.replace(/%~dp0/giu, `${baseDir}\\`).replace(/%dp0%/giu, `${baseDir}\\`);
+	return collectQuotedPackageTargets(normalized, baseDir);
+}
+
+function resolveWindowsPowerShellShimTargets(path: string, content: string): string[] {
+	const baseDir = dirname(path);
+	const normalized = content
+		.replace(/\$PSScriptRoot/giu, baseDir)
+		.replace(/\$\{basedir\}/gu, baseDir)
+		.replace(/\$basedir/gu, baseDir);
+	return collectQuotedPackageTargets(normalized, baseDir);
+}
+
+function resolveGenericShimTargets(path: string, content: string): string[] {
+	const baseDir = dirname(path);
+	const normalized = content.replace(/\$\{?basedir\}?/gu, baseDir);
+	return collectQuotedPackageTargets(normalized, baseDir);
+}
+
+function resolveShimTargets(path: string): string[] {
+	try {
+		const content = readFileSync(path, "utf8");
+		const fileName = basename(path).toLowerCase();
+		if (fileName.endsWith(".cmd") || fileName.endsWith(".bat")) {
+			return resolveWindowsCmdShimTargets(path, content);
+		}
+		if (fileName.endsWith(".ps1")) {
+			return resolveWindowsPowerShellShimTargets(path, content);
+		}
+		return resolveGenericShimTargets(path, content);
+	} catch {
+		return [];
+	}
+}
+
+function resolveExecutableTargets(path: string): string[] {
+	const targets: string[] = [];
+	addUniquePath(targets, path);
+
+	try {
+		addUniquePath(targets, realpathSync(path));
+	} catch {
+		// Ignore realpath failures and keep probing the original path.
+	}
+
+	for (const shimTarget of resolveShimTargets(path)) {
+		addUniquePath(targets, shimTarget);
+		try {
+			addUniquePath(targets, realpathSync(shimTarget));
+		} catch {
+			// Ignore shim target realpath failures and keep the resolved shim target.
+		}
+	}
+
+	return targets;
+}
+
+function hasPiBinMapping(pkg: Record<string, unknown>): boolean {
+	if (pkg.name !== PACKAGE_NAME || !isRecord(pkg.bin)) {
+		return false;
+	}
+
+	return typeof pkg.bin.pi === "string" && pkg.bin.pi.trim().length > 0;
+}
+
+function findPackageRootForExecutable(path: string): string | undefined {
+	for (const target of resolveExecutableTargets(path)) {
+		let current = dirname(target);
+		while (true) {
+			const packageJson = readJsonFile(join(current, "package.json"));
+			if (packageJson && hasPiBinMapping(packageJson)) {
+				return current;
+			}
+
+			const parent = dirname(current);
+			if (parent === current) {
+				break;
+			}
+			current = parent;
+		}
+	}
+
+	return undefined;
 }
 
 class UpdateStateRepository {
@@ -472,6 +695,11 @@ class InstallStrategyResolver {
 			};
 		}
 
+		const installedCommand = this.detectInstalledCommand();
+		if (installedCommand) {
+			return installedCommand;
+		}
+
 		const heuristicMethod = this.detectMethod();
 		const heuristicCommand = this.commandForMethod(heuristicMethod);
 		if (heuristicCommand) {
@@ -544,6 +772,24 @@ class InstallStrategyResolver {
 		return [command.command, ...command.args].join(" ");
 	}
 
+	private detectInstalledCommand(): ResolvedUpdateCommand | undefined {
+		const detectedInstall = this.detectInstalledPi();
+		if (!detectedInstall) {
+			return undefined;
+		}
+
+		const command = this.commandForMethod(detectedInstall.method);
+		if (!command) {
+			return undefined;
+		}
+
+		return {
+			command,
+			source: "detected-install-path",
+			installMethod: detectedInstall.method,
+		};
+	}
+
 	private detectMethod(): InstallMethod {
 		const userAgent = process.env.npm_config_user_agent?.toLowerCase() ?? "";
 		if (userAgent.startsWith("pnpm/")) {
@@ -579,6 +825,88 @@ class InstallStrategyResolver {
 		}
 
 		return "unknown";
+	}
+
+	private detectInstalledPi(): DetectedInstall | undefined {
+		const currentPackageRoot = this.getCurrentPackageRoot();
+		const globalBinDirectories = this.getGlobalBinDirectories();
+		for (const binPath of listPiExecutableCandidates()) {
+			const packageRoot = findPackageRootForExecutable(binPath);
+			if (!packageRoot) {
+				continue;
+			}
+			if (currentPackageRoot && !pathsEqual(packageRoot, currentPackageRoot)) {
+				continue;
+			}
+
+			const method = this.detectInstalledMethod(binPath, globalBinDirectories);
+			if (!method) {
+				continue;
+			}
+
+			return {
+				method,
+				binPath,
+				packageRoot,
+			};
+		}
+
+		return undefined;
+	}
+
+	private getCurrentPackageRoot(): string | undefined {
+		try {
+			return findPackageRootForExecutable(require.resolve("@mariozechner/pi-coding-agent"));
+		} catch {
+			return undefined;
+		}
+	}
+
+	private getGlobalBinDirectories(): Partial<Record<Exclude<InstallMethod, "unknown">, string>> {
+		const npmPrefix = runCommandCapture("npm", ["config", "get", "prefix"]);
+		const pnpmBinDir = runCommandCapture("pnpm", ["bin", "-g"]);
+		const yarnBinDir = runCommandCapture("yarn", ["global", "bin"]);
+		const bunBinDir = process.env.BUN_INSTALL
+			? join(process.env.BUN_INSTALL, "bin")
+			: runCommandCapture("bun", ["pm", "bin", "-g"]);
+
+		return {
+			npm: npmPrefix ? (process.platform === "win32" ? npmPrefix : join(npmPrefix, "bin")) : undefined,
+			pnpm: pnpmBinDir,
+			yarn: yarnBinDir,
+			bun: bunBinDir,
+		};
+	}
+
+	private detectInstalledMethod(
+		binPath: string,
+		globalBinDirectories: Partial<Record<Exclude<InstallMethod, "unknown">, string>>,
+	): Exclude<InstallMethod, "unknown"> | undefined {
+		const matches = (
+			Object.entries(globalBinDirectories) as Array<[Exclude<InstallMethod, "unknown">, string | undefined]>
+		)
+			.filter(([, directory]) => typeof directory === "string" && pathsEqual(dirname(binPath), directory))
+			.map(([method]) => method);
+		if (matches.includes("pnpm")) {
+			return "pnpm";
+		}
+		if (matches.includes("bun")) {
+			return "bun";
+		}
+
+		const hasNpm = matches.includes("npm");
+		const hasYarn = matches.includes("yarn");
+		if (hasNpm && hasYarn) {
+			return undefined;
+		}
+		if (hasNpm) {
+			return "npm";
+		}
+		if (hasYarn) {
+			return "yarn";
+		}
+
+		return undefined;
 	}
 
 	private getSettingsConfig(cwd: string): AutoUpdateSettingsConfig {
@@ -669,16 +997,46 @@ class UpdateScheduler {
 		}
 
 		const resolvedRestart = this.installStrategyResolver.resolveRestartCommand(ctx.cwd);
-		const payload = this.buildPosixPayload(latestVersion, ctx.cwd, resolvedUpdate, resolvedRestart.command);
+		const updateId = randomUUID();
+		const logFile = join(WINDOWS_LOG_DIR, `pi-auto-update-${updateId}.log`);
+		const payloadFile = join(WINDOWS_PAYLOAD_DIR, `pi-auto-update-${updateId}.json`);
+		const scheduledAt = Date.now();
+		const mode: WindowsUpdateMode = "helper-update-only";
+		const scheduledStatus: WindowsUpdateStatus = {
+			updateId,
+			phase: "scheduled",
+			latestVersion,
+			mode,
+			updateCommandDisplay: this.installStrategyResolver.formatCommand(resolvedUpdate.command),
+			restartCommandDisplay: this.installStrategyResolver.formatCommand(resolvedRestart.command),
+			logFile,
+			scheduledAt,
+			lastTransitionAt: scheduledAt,
+		};
+		const payload = this.buildPosixPayload(
+			updateId,
+			latestVersion,
+			ctx.cwd,
+			resolvedUpdate,
+			resolvedRestart.command,
+			mode,
+			logFile,
+		);
 
 		try {
-			const child = spawn(process.execPath, [RUNNER_FILE, this.encodePayload(payload)], {
+			writeJsonFile(payloadFile, payload);
+			this.windowsStatusRepository.write(scheduledStatus);
+
+			const child = spawn(process.execPath, [RUNNER_FILE, "--posix-payload", payloadFile], {
 				detached: true,
-				stdio: "inherit",
+				stdio: "ignore",
 				env: process.env,
 			});
 			child.unref();
-			ctx.ui.notify(`pi will exit, update to ${latestVersion}, then restart automatically.`, "info");
+			ctx.ui.notify(
+				`pi will exit and update to ${latestVersion} in the background. Restart pi manually after the update completes. Log: ${logFile}`,
+				"info",
+			);
 			ctx.shutdown();
 			return {
 				scheduled: true,
@@ -687,7 +1045,14 @@ class UpdateScheduler {
 			};
 		} catch (error: unknown) {
 			const message = error instanceof Error ? error.message : String(error);
-			ctx.ui.notify(`Failed to schedule pi restart: ${message}`, "error");
+			this.windowsStatusRepository.write({
+				...scheduledStatus,
+				phase: "failed",
+				error: message,
+				failedAt: Date.now(),
+				lastTransitionAt: Date.now(),
+			});
+			ctx.ui.notify(`Failed to schedule the POSIX updater: ${message}`, "error");
 			return { scheduled: false };
 		}
 	}
@@ -783,19 +1148,27 @@ class UpdateScheduler {
 	}
 
 	private buildPosixPayload(
+		updateId: string,
 		latestVersion: string,
 		cwd: string,
 		resolvedUpdate: ResolvedUpdateCommand,
 		restartCommand: CommandSpec,
+		mode: WindowsUpdateMode,
+		logFile: string,
 	): ScheduledUpdatePayload {
 		return {
+			updateId,
 			parentPid: process.pid,
 			cwd,
 			stateFile: STATE_FILE,
+			statusFile: STATUS_FILE,
 			latestVersion,
+			mode,
 			updateCommand: resolvedUpdate.command,
 			restartCommand,
 			updateCommandDisplay: this.installStrategyResolver.formatCommand(resolvedUpdate.command),
+			restartCommandDisplay: this.installStrategyResolver.formatCommand(restartCommand),
+			logFile,
 			validatedInstallMethod: resolvedUpdate.installMethod,
 		};
 	}
@@ -824,10 +1197,6 @@ class UpdateScheduler {
 			logFile,
 			validatedInstallMethod: resolvedUpdate.installMethod,
 		};
-	}
-
-	private encodePayload(payload: ScheduledUpdatePayload): string {
-		return Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
 	}
 }
 
@@ -1014,7 +1383,7 @@ class WindowsUpdateStatusService {
 	) {}
 
 	handleStartup(ctx: UIContext): void {
-		if (!ctx.hasUI || process.platform !== "win32") {
+		if (!ctx.hasUI) {
 			return;
 		}
 

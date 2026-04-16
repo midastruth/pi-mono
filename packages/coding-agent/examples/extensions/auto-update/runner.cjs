@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 const { spawn } = require("node:child_process");
-const { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } = require("node:fs");
+const { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } = require("node:fs");
 const { dirname } = require("node:path");
 
 function delay(ms) {
@@ -61,38 +61,50 @@ function parseCommandSpec(value) {
 	throw new Error("Invalid command spec");
 }
 
-function decodePosixPayload(encodedPayload) {
-	const json = Buffer.from(encodedPayload, "base64url").toString("utf8");
-	const parsed = JSON.parse(json);
-
+function loadPosixPayload(payloadFile) {
+	const parsed = JSON.parse(readFileSync(payloadFile, "utf8"));
 	if (!isRecord(parsed)) {
-		throw new Error("Invalid auto-update payload");
+		throw new Error("Invalid POSIX auto-update payload");
 	}
 
 	if (
+		typeof parsed.updateId !== "string" ||
+		parsed.updateId.trim().length === 0 ||
 		typeof parsed.parentPid !== "number" ||
 		!Number.isInteger(parsed.parentPid) ||
 		parsed.parentPid <= 0 ||
 		typeof parsed.cwd !== "string" ||
-		parsed.cwd.length === 0 ||
+		parsed.cwd.trim().length === 0 ||
 		typeof parsed.stateFile !== "string" ||
-		parsed.stateFile.length === 0 ||
+		parsed.stateFile.trim().length === 0 ||
+		typeof parsed.statusFile !== "string" ||
+		parsed.statusFile.trim().length === 0 ||
 		typeof parsed.latestVersion !== "string" ||
-		parsed.latestVersion.length === 0 ||
+		parsed.latestVersion.trim().length === 0 ||
+		(parsed.mode !== "helper-update-only" && parsed.mode !== "helper-update-and-restart") ||
+		typeof parsed.logFile !== "string" ||
+		parsed.logFile.trim().length === 0 ||
 		typeof parsed.updateCommandDisplay !== "string" ||
-		parsed.updateCommandDisplay.length === 0
+		parsed.updateCommandDisplay.trim().length === 0 ||
+		typeof parsed.restartCommandDisplay !== "string" ||
+		parsed.restartCommandDisplay.trim().length === 0
 	) {
-		throw new Error("Invalid auto-update payload");
+		throw new Error("Invalid POSIX auto-update payload");
 	}
 
 	return {
+		updateId: parsed.updateId,
 		parentPid: parsed.parentPid,
 		cwd: parsed.cwd,
 		stateFile: parsed.stateFile,
+		statusFile: parsed.statusFile,
 		latestVersion: parsed.latestVersion,
+		mode: parsed.mode,
 		updateCommand: parseCommandSpec(parsed.updateCommand),
 		restartCommand: parseCommandSpec(parsed.restartCommand),
 		updateCommandDisplay: parsed.updateCommandDisplay,
+		restartCommandDisplay: parsed.restartCommandDisplay,
+		logFile: parsed.logFile,
 		validatedInstallMethod: parseInstallMethod(parsed.validatedInstallMethod),
 	};
 }
@@ -214,9 +226,25 @@ async function waitForParentExit(pid, logFile) {
 	}
 }
 
-function runCommand(spec, cwd, waitForExit) {
+function runCommand(spec, cwd, waitForExit, logFile) {
 	return new Promise((resolve, reject) => {
-		const options = { cwd, stdio: "inherit", env: process.env, shell: false };
+		mkdirForFile(logFile);
+		const logFd = openSync(logFile, "a");
+		let closed = false;
+		const closeLog = () => {
+			if (closed) {
+				return;
+			}
+			closed = true;
+			closeSync(logFd);
+		};
+		const options = {
+			cwd,
+			stdio: ["ignore", logFd, logFd],
+			env: process.env,
+			shell: false,
+			detached: !waitForExit,
+		};
 		const child =
 			spec.kind === "shell"
 				? process.platform === "win32"
@@ -227,14 +255,21 @@ function runCommand(spec, cwd, waitForExit) {
 						shell: process.platform === "win32",
 				  });
 
-		child.on("error", reject);
+		child.on("error", (error) => {
+			closeLog();
+			reject(error);
+		});
 		if (!waitForExit) {
 			child.unref();
+			closeLog();
 			resolve(0);
 			return;
 		}
 
-		child.on("close", (code) => resolve(code ?? 0));
+		child.on("close", (code) => {
+			closeLog();
+			resolve(code ?? 0);
+		});
 	});
 }
 
@@ -256,42 +291,80 @@ function toWindowsCommandLine(spec) {
 	return [quoteWindowsArg(spec.command), ...spec.args.map((arg) => quoteWindowsArg(arg))].join(" ");
 }
 
-function runWindowsCommand(spec, cwd, waitForExit) {
+function runWindowsCommand(spec, cwd, waitForExit, logFile) {
 	return new Promise((resolve, reject) => {
+		mkdirForFile(logFile);
+		const logFd = openSync(logFile, "a");
+		let closed = false;
+		const closeLog = () => {
+			if (closed) {
+				return;
+			}
+			closed = true;
+			closeSync(logFd);
+		};
 		const commandLine = toWindowsCommandLine(spec);
 		const child = spawn(process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", commandLine], {
 			cwd,
 			env: process.env,
-			stdio: "ignore",
+			stdio: ["ignore", logFd, logFd],
 			shell: false,
 			windowsHide: true,
 			detached: !waitForExit,
 		});
 
-		child.on("error", reject);
+		child.on("error", (error) => {
+			closeLog();
+			reject(error);
+		});
 		if (!waitForExit) {
 			child.unref();
+			closeLog();
 			resolve(0);
 			return;
 		}
 
-		child.on("close", (code) => resolve(code ?? 0));
+		child.on("close", (code) => {
+			closeLog();
+			resolve(code ?? 0);
+		});
 	});
 }
 
 async function runScheduledUpdate(payload) {
-	await waitForParentExit(payload.parentPid);
-	console.log(`\nUpdating pi to ${payload.latestVersion}...`);
+	appendLog(payload.logFile, "POSIX updater helper started for version " + payload.latestVersion + ".");
+	writeWindowsStatus(payload, {
+		phase: "updating",
+		error: undefined,
+	});
 
-	const updateCode = await runCommand(payload.updateCommand, payload.cwd, true);
+	appendLog(payload.logFile, "Waiting for pi process " + payload.parentPid + " to exit.");
+	await waitForParentExit(payload.parentPid, payload.logFile);
+	appendLog(payload.logFile, "pi process exited. Running update command: " + payload.updateCommandDisplay);
+
+	const updateCode = await runCommand(payload.updateCommand, payload.cwd, true, payload.logFile);
 	if (updateCode !== 0) {
-		console.error(`\npi auto-update failed. Run manually: ${payload.updateCommandDisplay}`);
-		process.exit(updateCode);
+		const errorMessage = "Update command failed with exit code " + updateCode + ". Run manually: " + payload.updateCommandDisplay;
+		appendLog(payload.logFile, errorMessage);
+		writeWindowsStatus(payload, {
+			phase: "failed",
+			error: errorMessage,
+			failedAt: Date.now(),
+		});
+		process.exit(updateCode || 1);
 	}
 
 	writeValidatedState(payload);
-	console.log("\npi updated successfully. Restarting...");
-	await runCommand(payload.restartCommand, payload.cwd, false);
+	appendLog(payload.logFile, "Update command completed successfully.");
+	writeWindowsStatus(payload, {
+		phase: "updated",
+		error: undefined,
+		updatedAt: Date.now(),
+	});
+	appendLog(
+		payload.logFile,
+		"Update completed. Automatic restart disabled for the detached POSIX updater; restart pi manually using: " + payload.restartCommandDisplay,
+	);
 }
 
 async function runWindowsScheduledUpdate(payload) {
@@ -305,7 +378,7 @@ async function runWindowsScheduledUpdate(payload) {
 	await waitForParentExit(payload.parentPid, payload.logFile);
 	appendLog(payload.logFile, "pi process exited. Running update command: " + payload.updateCommandDisplay);
 
-	const updateCode = await runWindowsCommand(payload.updateCommand, payload.cwd, true);
+	const updateCode = await runWindowsCommand(payload.updateCommand, payload.cwd, true, payload.logFile);
 	if (updateCode !== 0) {
 		const errorMessage = "Update command failed with exit code " + updateCode + ". Run manually: " + payload.updateCommandDisplay;
 		appendLog(payload.logFile, errorMessage);
@@ -337,7 +410,7 @@ async function runWindowsScheduledUpdate(payload) {
 	});
 
 	try {
-		await runWindowsCommand(payload.restartCommand, payload.cwd, false);
+		await runWindowsCommand(payload.restartCommand, payload.cwd, false, payload.logFile);
 		appendLog(payload.logFile, "Restart command launched successfully.");
 		writeWindowsStatus(payload, {
 			phase: "completed",
@@ -367,13 +440,17 @@ async function main() {
 		return;
 	}
 
-	const encodedPayload = process.argv[2];
-	if (!encodedPayload) {
-		throw new Error("Missing auto-update payload argument");
+	if (process.argv[2] === "--posix-payload") {
+		const payloadFile = process.argv[3];
+		if (!payloadFile) {
+			throw new Error("Missing POSIX auto-update payload path");
+		}
+		const payload = loadPosixPayload(payloadFile);
+		await runScheduledUpdate(payload);
+		return;
 	}
 
-	const payload = decodePosixPayload(encodedPayload);
-	await runScheduledUpdate(payload);
+	throw new Error("Missing auto-update payload argument");
 }
 
 if (require.main === module) {
@@ -388,7 +465,7 @@ if (require.main === module) {
 }
 
 module.exports = {
-	decodePosixPayload,
+	loadPosixPayload,
 	loadWindowsPayload,
 	runCommand,
 	runScheduledUpdate,
