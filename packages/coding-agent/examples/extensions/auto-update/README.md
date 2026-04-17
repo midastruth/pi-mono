@@ -1,34 +1,38 @@
 # Auto Update Extension
 
-Auto-update extension for pi with a detached runner, semver-based version comparison, Windows restart support, configurable changelog keybindings, and layered update-command resolution.
+Auto-update extension for pi with a terminal handoff updater, inline semver comparison (no external dependency), Windows restart support, configurable changelog keybindings, and layered update-command resolution.
 
 ## Files
 
 ```text
 auto-update/
-├── index.ts
 ├── package.json
+├── package-lock.json
 ├── README.md
-└── runner.cjs
+├── runner.cjs
+└── update.ts
 ```
 
 ## Install
 
-Copy the whole directory into your extensions folder, then install its local dependencies:
+Copy the whole directory into your extensions folder:
 
 ```bash
 mkdir -p ~/.pi/agent/extensions
 cp -R auto-update ~/.pi/agent/extensions/
-cd ~/.pi/agent/extensions/auto-update
-npm install
 ```
 
-pi will auto-discover `index.ts` from that directory.
+This example currently has no local runtime dependencies, so `npm install` is not required.
+
+pi will discover the extension entry from `package.json` via `pi.extensions`, which points to `./update.ts`.
+
+You can also install it project-locally under `.pi/extensions/auto-update/`.
 
 ## Optional environment variables
 
 - `PI_AUTO_UPDATE_COMMAND` - override the update command
 - `PI_AUTO_UPDATE_RESTART_COMMAND` - override the restart command
+- `PI_AUTO_UPDATE_BACKGROUND=1` - disable terminal handoff and force the detached background updater
 
 ## Commands
 
@@ -93,19 +97,22 @@ Example:
 
 If `updateCommand` is omitted but `installMethod` is present, the extension derives the default command for that package manager.
 
-## Background updater behavior
+## Update flow behavior
 
-On all platforms the extension uses a dedicated background flow:
+In interactive TTY sessions the extension uses a terminal handoff flow:
 
 1. pi writes a payload file to `~/.pi/agent/tmp/`
 2. pi writes update status to `~/.pi/agent/pi-auto-update-status.json`
-3. `runner.cjs` continues in the background after pi exits
-4. The runner writes logs to `~/.pi/agent/logs/pi-auto-update-<id>.log`
+3. pi exits its TUI
+4. `runner.cjs` takes over the same terminal, shows an animated elapsed-time progress indicator, and finishes with a clear success or failure message
+5. Detailed command output is still written to `~/.pi/agent/logs/pi-auto-update-<id>.log`
+
+If a TTY handoff is not available, the extension falls back to the detached background flow.
 
 Platform behavior:
 
-- POSIX: updates in the background and records status/logs; restart pi manually after the update completes
-- Windows: updates in the background and either restarts pi automatically or leaves a status message instructing you to restart manually
+- POSIX: terminal handoff updates in the current terminal and prints a final manual-restart message; detached fallback updates in the background and records status/logs
+- Windows: terminal handoff updates in the current terminal and prints a final manual-restart message; detached fallback can still auto-restart when the restart command source is trusted
 
 Persisted restart commands recovered from prior validated state are not auto-executed on Windows. In that case the extension downgrades to update-only mode unless the restart command comes from:
 
@@ -123,8 +130,9 @@ On next startup, the extension inspects `pi-auto-update-status.json` and reports
 
 ## Notes
 
-- `runner.cjs` is a detached helper process used for waiting on pi to exit, performing the update, and writing background status/log files on both POSIX and Windows.
+- `runner.cjs` is used both for detached background updates and for terminal handoff updates that keep the current terminal occupied until the update finishes.
 - After a successful update, the runner writes the validated update and restart commands back to `~/.pi/agent/version.json` so future launches prefer proven commands over path detection and heuristics.
+- Before running the update command, the runner also stores `rollbackCommand` and `rollbackVersion` in `~/.pi/agent/version.json` when the current version is known.
 - Background update progress is persisted in `~/.pi/agent/pi-auto-update-status.json` and detailed logs are written under `~/.pi/agent/logs/`.
 - The changelog viewer uses pi's configured keybindings (`tui.select.*` plus `tui.editor.cursorLineStart/cursorLineEnd`) instead of hardcoded keys.
-- `package.json` is required so the extension can carry its own `semver` dependency when copied out of the monorepo.
+- `package.json` is required for the `pi.extensions` declaration; semver comparison is now inlined so there are no external runtime dependencies.

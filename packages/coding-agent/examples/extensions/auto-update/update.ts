@@ -11,7 +11,7 @@
  * - Caches the latest version for a few hours to avoid hitting npm on every launch.
  * - Stores skip state in ~/.pi/agent/version.json.
  * - Override the install command with PI_AUTO_UPDATE_COMMAND if you do not use npm.
- * - On "Update now", pi exits first, updates in a detached runner, then restarts automatically.
+ * - On "Update now", pi exits its TUI, hands the terminal to the updater, shows an animated progress indicator there, and prints the final result.
  *
  * Usage:
  * 1. Copy this directory to ~/.pi/agent/extensions/auto-update/
@@ -23,7 +23,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
-import { createRequire } from "node:module";
 import { basename, delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, Theme } from "@mariozechner/pi-coding-agent";
@@ -38,13 +37,28 @@ import {
 	truncateToWidth,
 } from "@mariozechner/pi-tui";
 
-const require = createRequire(import.meta.url);
-const semver: {
-	compare: (a: string, b: string) => number;
-	valid: (version: string) => string | null;
-} = require("semver");
-const compareSemver = semver.compare;
-const validSemver = semver.valid;
+function parseSemverParts(version: string): [number, number, number] | undefined {
+	const match = /^v?(\d+)\.(\d+)\.(\d+)(?:[.+-].*)?$/.exec(version.trim());
+	if (!match) return undefined;
+	return [parseInt(match[1], 10), parseInt(match[2], 10), parseInt(match[3], 10)];
+}
+
+function compareSemver(a: string, b: string): number {
+	const left = parseSemverParts(a);
+	const right = parseSemverParts(b);
+	if (left && right) {
+		for (let i = 0; i < 3; i++) {
+			if (left[i] !== right[i]) return (left[i] as number) - (right[i] as number);
+		}
+		return 0;
+	}
+	return a.trim().localeCompare(b.trim(), undefined, { numeric: true, sensitivity: "base" });
+}
+
+function validSemver(version: string): string | undefined {
+	const trimmed = version.trim();
+	return parseSemverParts(trimmed) ? trimmed.replace(/^v/i, "") : undefined;
+}
 
 const PACKAGE_NAME = "@mariozechner/pi-coding-agent";
 const CHANGELOG_URL = "https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/CHANGELOG.md";
@@ -133,6 +147,7 @@ interface ScheduledUpdatePayload {
 	stateFile: string;
 	statusFile: string;
 	latestVersion: string;
+	currentVersion: string;
 	mode: WindowsUpdateMode;
 	updateCommand: CommandSpec;
 	restartCommand: CommandSpec;
@@ -149,6 +164,7 @@ interface WindowsUpdatePayload {
 	stateFile: string;
 	statusFile: string;
 	latestVersion: string;
+	currentVersion: string;
 	mode: WindowsUpdateMode;
 	updateCommand: CommandSpec;
 	restartCommand: CommandSpec;
@@ -181,6 +197,71 @@ type ScheduleResult =
 			updateCommand: CommandSpec;
 			restartCommand: CommandSpec;
 	  };
+
+interface AutoUpdateProcessState {
+	exitHookInstalled: boolean;
+	foregroundRunnerStarted: boolean;
+	pendingForegroundPayloadFile?: string;
+}
+
+type AutoUpdateProcessGlobal = typeof globalThis & {
+	__piAutoUpdateProcessState__?: AutoUpdateProcessState;
+};
+
+function getAutoUpdateProcessState(): AutoUpdateProcessState {
+	const globalState = globalThis as AutoUpdateProcessGlobal;
+	const processState = globalState.__piAutoUpdateProcessState__;
+	if (processState) {
+		return processState;
+	}
+
+	const nextState: AutoUpdateProcessState = {
+		exitHookInstalled: false,
+		foregroundRunnerStarted: false,
+	};
+	globalState.__piAutoUpdateProcessState__ = nextState;
+	return nextState;
+}
+
+function queueForegroundUpdate(payloadFile: string): void {
+	const processState = getAutoUpdateProcessState();
+	processState.pendingForegroundPayloadFile = payloadFile;
+}
+
+function installForegroundUpdateExitHook(): void {
+	const processState = getAutoUpdateProcessState();
+	if (processState.exitHookInstalled) {
+		return;
+	}
+
+	process.on("exit", () => {
+		const currentState = getAutoUpdateProcessState();
+		const payloadFile = currentState.pendingForegroundPayloadFile;
+		if (!payloadFile || currentState.foregroundRunnerStarted) {
+			return;
+		}
+
+		currentState.foregroundRunnerStarted = true;
+		currentState.pendingForegroundPayloadFile = undefined;
+		const result = spawnSync(process.execPath, [RUNNER_FILE, "--foreground-payload", payloadFile], {
+			stdio: "inherit",
+			env: process.env,
+			windowsHide: false,
+		});
+		if (result.error) {
+			console.error(`Failed to start foreground pi updater: ${result.error.message}`);
+			process.exitCode = 1;
+			return;
+		}
+
+		const status = typeof result.status === "number" ? result.status : 1;
+		if (status !== 0) {
+			process.exitCode = status;
+		}
+	});
+
+	processState.exitHookInstalled = true;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -601,14 +682,7 @@ class VersionService {
 	constructor(private readonly stateRepository: UpdateStateRepository) {}
 
 	compare(a: string, b: string): number {
-		const left = this.normalizeVersion(a);
-		const right = this.normalizeVersion(b);
-
-		if (left && right) {
-			return compareSemver(left, right);
-		}
-
-		return a.trim().localeCompare(b.trim(), undefined, { numeric: true, sensitivity: "base" });
+		return compareSemver(a, b);
 	}
 
 	async fetchLatest(): Promise<string | undefined> {
@@ -620,7 +694,7 @@ class VersionService {
 		}
 
 		const data = (await response.json()) as NpmLatestResponse;
-		return typeof data.version === "string" && data.version.trim().length > 0 ? data.version.trim() : undefined;
+		return typeof data.version === "string" ? validSemver(data.version) : undefined;
 	}
 
 	async getLatestWithCache(force: boolean): Promise<string | undefined> {
@@ -649,11 +723,6 @@ class VersionService {
 
 	isSameOrNewer(candidateVersion: string, baselineVersion: string): boolean {
 		return this.compare(candidateVersion, baselineVersion) >= 0;
-	}
-
-	private normalizeVersion(version: string): string | undefined {
-		const trimmed = version.trim();
-		return validSemver(trimmed) ?? validSemver(trimmed.replace(/^v/i, "")) ?? undefined;
 	}
 }
 
@@ -856,7 +925,7 @@ class InstallStrategyResolver {
 
 	private getCurrentPackageRoot(): string | undefined {
 		try {
-			return findPackageRootForExecutable(require.resolve("@mariozechner/pi-coding-agent"));
+			return findPackageRootForExecutable(fileURLToPath(import.meta.resolve("@mariozechner/pi-coding-agent")));
 		} catch {
 			return undefined;
 		}
@@ -1026,10 +1095,23 @@ class UpdateScheduler {
 		try {
 			writeJsonFile(payloadFile, payload);
 			this.windowsStatusRepository.write(scheduledStatus);
+			if (this.shouldUseForegroundTerminalHandoff()) {
+				queueForegroundUpdate(payloadFile);
+				ctx.ui.notify(
+					`pi will exit and this terminal will show the update progress to ${latestVersion}. Command output is still written to ${logFile}.`,
+					"info",
+				);
+				ctx.shutdown();
+				return {
+					scheduled: true,
+					updateCommand: resolvedUpdate.command,
+					restartCommand: resolvedRestart.command,
+				};
+			}
 
 			const child = spawn(process.execPath, [RUNNER_FILE, "--posix-payload", payloadFile], {
 				detached: true,
-				stdio: "ignore",
+				stdio: ["ignore", "ignore", "ignore", "ipc"],
 				env: process.env,
 			});
 			child.unref();
@@ -1076,9 +1158,12 @@ class UpdateScheduler {
 		}
 
 		const resolvedRestart = this.installStrategyResolver.resolveRestartCommand(ctx.cwd);
-		const mode: WindowsUpdateMode = resolvedRestart.autoRestartAllowed
-			? "helper-update-and-restart"
-			: "helper-update-only";
+		const useForegroundTerminalHandoff = this.shouldUseForegroundTerminalHandoff();
+		const mode: WindowsUpdateMode = useForegroundTerminalHandoff
+			? "helper-update-only"
+			: resolvedRestart.autoRestartAllowed
+				? "helper-update-and-restart"
+				: "helper-update-only";
 		const updateId = randomUUID();
 		const logFile = join(WINDOWS_LOG_DIR, `pi-auto-update-${updateId}.log`);
 		const payloadFile = join(WINDOWS_PAYLOAD_DIR, `pi-auto-update-${updateId}.json`);
@@ -1107,10 +1192,23 @@ class UpdateScheduler {
 		try {
 			writeJsonFile(payloadFile, payload);
 			this.windowsStatusRepository.write(scheduledStatus);
+			if (useForegroundTerminalHandoff) {
+				queueForegroundUpdate(payloadFile);
+				ctx.ui.notify(
+					`pi will exit and this terminal will show the update progress to ${latestVersion}. After the update completes, restart pi manually. Command output is still written to ${logFile}.`,
+					"info",
+				);
+				ctx.shutdown();
+				return {
+					scheduled: true,
+					updateCommand: resolvedUpdate.command,
+					restartCommand: resolvedRestart.command,
+				};
+			}
 
 			const child = spawn(process.execPath, [RUNNER_FILE, "--windows-payload", payloadFile], {
 				detached: true,
-				stdio: "ignore",
+				stdio: ["ignore", "ignore", "ignore", "ipc"],
 				windowsHide: true,
 				env: process.env,
 			});
@@ -1147,6 +1245,12 @@ class UpdateScheduler {
 		}
 	}
 
+	private shouldUseForegroundTerminalHandoff(): boolean {
+		return (
+			process.stdout.isTTY === true && process.stderr.isTTY === true && process.env.PI_AUTO_UPDATE_BACKGROUND !== "1"
+		);
+	}
+
 	private buildPosixPayload(
 		updateId: string,
 		latestVersion: string,
@@ -1163,6 +1267,7 @@ class UpdateScheduler {
 			stateFile: STATE_FILE,
 			statusFile: STATUS_FILE,
 			latestVersion,
+			currentVersion: VERSION,
 			mode,
 			updateCommand: resolvedUpdate.command,
 			restartCommand,
@@ -1189,6 +1294,7 @@ class UpdateScheduler {
 			stateFile: STATE_FILE,
 			statusFile: STATUS_FILE,
 			latestVersion,
+			currentVersion: VERSION,
 			mode,
 			updateCommand: resolvedUpdate.command,
 			restartCommand: resolvedRestart.command,
@@ -1642,6 +1748,7 @@ class AutoUpdateController {
 
 export default function autoUpdateExtension(pi: ExtensionAPI) {
 	process.env.PI_SKIP_VERSION_CHECK = "1";
+	installForegroundUpdateExitHook();
 
 	const stateRepository = new UpdateStateRepository(STATE_FILE, AGENT_DIR);
 	const windowsStatusRepository = new WindowsUpdateStatusRepository(STATUS_FILE);
